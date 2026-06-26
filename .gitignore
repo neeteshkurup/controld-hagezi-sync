@@ -1,0 +1,10 @@
+# User configuration (contains sensitive tokens)
+config.toml
+
+# macOS
+.DS_Store
+
+# Editor backups
+*~
+*.swp
+*.swo

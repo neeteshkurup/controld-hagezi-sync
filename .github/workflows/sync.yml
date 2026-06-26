@@ -1,0 +1,50 @@
+name: Sync Hagezi to ControlD
+
+on:
+  # Run daily at 03:00 UTC
+  schedule:
+    - cron: '0 3 * * *'
+
+  # Allow manual trigger with optional parameters
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Specific profile to sync (leave empty for all)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (preview only, no changes)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    name: Sync DNS Blocklists
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+      - name: Validate configuration exists
+        run: |
+          if [[ ! -f config.toml ]]; then
+            echo "ERROR: config.toml not found. Copy config.toml.example to config.toml and commit it."
+            exit 1
+          fi
+
+      - name: Run sync
+        env:
+          CONTROLD_API_TOKEN: ${{ secrets.CONTROLD_API_TOKEN }}
+        run: |
+          ARGS=()
+          [[ -n "${{ github.event.inputs.profile }}" ]] && ARGS+=("--profile" "${{ github.event.inputs.profile }}")
+          [[ "${{ github.event.inputs.dry_run }}" == "true" ]] && ARGS+=("--dry-run")
+          ./sync-hagezi.sh "${ARGS[@]}"

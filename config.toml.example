@@ -1,0 +1,46 @@
+# =============================================================================
+# ControlD Hagezi Sync — Configuration
+# =============================================================================
+# Copy this file to config.toml and customize it.
+# DO NOT commit config.toml if it contains your API token.
+# =============================================================================
+
+[settings]
+# Your ControlD API Write Token.
+# Get it from: https://controld.com/dashboard/api
+# You can also leave this empty and use the CONTROLD_API_TOKEN env var.
+api_token = ""
+
+# Set to true to preview changes without modifying anything.
+dry_run = false
+
+[profiles]
+# Exact names of your ControlD profiles (case-sensitive).
+names = ["Tesla", "Kids", "Friends", "Adults"]
+
+# =============================================================================
+# FOLDER DEFINITIONS
+# =============================================================================
+# Each line under [folders] maps a friendly name → Hagezi JSON URL.
+# The friendly name is what appears in your ControlD dashboard.
+# =============================================================================
+
+[folders]
+"Badware Hoster"         = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/badware-hoster-folder.json"
+"Most Abused TLDs"       = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-tlds-combined-folder.json"
+"Spam IDNs"              = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/spam-idns-folder.json"
+"No Safesearch Support"  = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/nosafesearch-folder.json"
+"META Tracker Allow"     = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/meta-tracker-allow-folder.json"
+
+# =============================================================================
+# PROFILE → FOLDER MAPPINGS
+# =============================================================================
+# For each profile, list which folders (by friendly name) it should receive.
+# Use the exact names from the [folders] section above.
+# =============================================================================
+
+[profile_folders]
+Tesla   = ["Badware Hoster", "Most Abused TLDs", "Spam IDNs"]
+Kids    = ["Badware Hoster", "Most Abused TLDs", "Spam IDNs", "No Safesearch Support"]
+Friends = ["Badware Hoster", "Most Abused TLDs", "Spam IDNs", "META Tracker Allow"]
+Adults  = ["Badware Hoster", "Most Abused TLDs", "Spam IDNs", "META Tracker Allow"]
