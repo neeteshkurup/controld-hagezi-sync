@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD Hagezi Folder Auto-Sync
-# Version: 1.1.0
+# Version: 1.2.0
 # Description: Syncs Hagezi DNS blocklist folders to ControlD profiles.
 #              Pure Bash. No Python. TOML-driven configuration.
 # Requirements: bash 4.3+, curl, jq
@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -29,6 +29,10 @@ HAGEZI_API="https://api.github.com/repos/hagezi/dns-blocklists/commits"
 
 # Batch size for rule insertion (ControlD API limit)
 BATCH_SIZE=500
+
+# API retry configuration
+API_RETRIES=3
+API_BACKOFF_BASE=2
 
 # ---------------------------------------------------------------------------
 # GLOBALS (populated by load_config)
@@ -59,6 +63,75 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
+# API RETRY HELPER
+# ---------------------------------------------------------------------------
+
+# Make an API call with automatic retry on 429/5xx errors.
+# Usage: api_call_with_retry <method> <url> [data]
+# Prints response body on success, returns 1 on failure.
+api_call_with_retry() {
+    local method="$1"
+    local url="$2"
+    local data="${3:-}"
+    local retries=$API_RETRIES
+    local delay=$API_BACKOFF_BASE
+    local resp code body retry_after
+
+    while true; do
+        if [[ -n "$data" ]]; then
+            resp=$(curl -s --request "$method" \
+                --url "$url" \
+                --header "${AUTH_HEADER}" \
+                --header "content-type: application/json" \
+                --data "$data" \
+                -w "\n%{http_code}")
+        else
+            resp=$(curl -s --request "$method" \
+                --url "$url" \
+                --header "${AUTH_HEADER}" \
+                -w "\n%{http_code}")
+        fi
+
+        code=$(echo "$resp" | tail -n1)
+        body=$(echo "$resp" | sed '$d')
+
+        # Success codes
+        if [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]]; then
+            echo "$body"
+            return 0
+        fi
+
+        # Rate limited — respect Retry-After if present
+        if [[ "$code" == "429" ]]; then
+            retry_after=$(echo "$resp" | grep -i "^retry-after:" | awk '{print $2}' | tr -d '\r' 2>/dev/null)
+            if [[ -n "$retry_after" && "$retry_after" =~ ^[0-9]+$ ]]; then
+                log "  WARN: Rate limited (429), waiting ${retry_after}s..."
+                sleep "$retry_after"
+            else
+                log "  WARN: Rate limited (429), backing off ${delay}s..."
+                sleep "$delay"
+                delay=$((delay * 2))
+            fi
+        # Server errors — exponential backoff
+        elif [[ "$code" == 5* ]]; then
+            log "  WARN: Server error (HTTP $code), retrying in ${delay}s..."
+            sleep "$delay"
+            delay=$((delay * 2))
+        # Client errors — don't retry (except 429 handled above)
+        else
+            log "  ERROR: API call failed (HTTP $code)"
+            return 1
+        fi
+
+        retries=$((retries - 1))
+        if [[ "$retries" -le 0 ]]; then
+            log "  ERROR: Max retries exceeded for $method $url"
+            return 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
 # TOML PARSER (Pure Bash)
 # ---------------------------------------------------------------------------
 
@@ -70,6 +143,8 @@ declare -A _TOML_VALS
 # Parse a TOML file into _TOML_VALS.
 # Supports: [section], key = "val", key = ["a", "b"], key = true/false
 #           quoted keys: "Key Name" = "value"
+# Limitations: no escaped quotes, no multi-line literals, no inline tables,
+#              no date/time types, comments stripped naively.
 parse_toml() {
     local file="$1"
     local line section="" key raw_val val
@@ -91,6 +166,7 @@ parse_toml() {
         fi
 
         # Skip inline comments (naive: everything after unquoted #)
+        # This is a known limitation — escaped # inside strings will break
         line="${line%%#*}"
         [[ -z "${line// /}" ]] && continue
 
@@ -167,6 +243,7 @@ parse_toml() {
 
 # Parse a TOML array body like: "a", "b", "c"
 # Returns pipe-delimited string: a|b|c
+# Limitation: does not handle escaped quotes inside strings.
 parse_toml_array() {
     local inner="$1"
     local -a items=()
@@ -295,6 +372,56 @@ load_config() {
     fi
 }
 
+# Validate parsed configuration for common errors.
+# Catches malformed URLs and unmapped profiles.
+validate_config() {
+    local key url
+    local has_errors=0
+
+    # Validate folder URLs
+    for key in "${!_TOML_VALS[@]}"; do
+        [[ "$key" == folders\|* ]] || continue
+        url="${_TOML_VALS[$key]}"
+        if [[ -z "$url" ]]; then
+            log "ERROR: Empty URL for [$key]"
+            has_errors=1
+        elif [[ ! "$url" =~ ^https?:// ]]; then
+            log "ERROR: Invalid URL in [$key]: $url (must start with http:// or https://)"
+            has_errors=1
+        fi
+    done
+
+    # Warn about profiles with no folder mappings
+    local pname
+    for pname in "${PROFILE_NAMES[@]}"; do
+        if [[ -z "${PROFILE_FOLDERS[$pname]}" ]]; then
+            log "WARN: Profile '$pname' has no [profile_folders] mapping -- will be skipped"
+        fi
+    done
+
+    # Check for profile_folders mappings that reference unknown profiles
+    for key in "${!_TOML_VALS[@]}"; do
+        [[ "$key" == profile_folders\|* ]] || continue
+        pname="${key#profile_folders\|}"
+        local found=0
+        local p
+        for p in "${PROFILE_NAMES[@]}"; do
+            if [[ "$p" == "$pname" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ "$found" -eq 0 ]]; then
+            log "WARN: [profile_folders] has mapping for '$pname' but it's not in [profiles] names"
+        fi
+    done
+
+    if [[ "$has_errors" -ne 0 ]]; then
+        log "FATAL: Configuration validation failed"
+        exit 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # DEPENDENCY CHECKS
 # ---------------------------------------------------------------------------
@@ -319,18 +446,10 @@ check_deps() {
 # ---------------------------------------------------------------------------
 
 get_all_profiles() {
-    local resp code body
-    resp=$(curl -s --request GET \
-        --url "${API_BASE}/profiles" \
-        --header "${AUTH_HEADER}" \
-        --header "accept: application/json" \
-        -w "\n%{http_code}")
-
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
-
-    if [[ "$code" != "200" ]]; then
-        log "ERROR: Failed to fetch profiles (HTTP $code)" >&2
+    local body
+    body=$(api_call_with_retry "GET" "${API_BASE}/profiles")
+    if [[ $? -ne 0 ]]; then
+        log "ERROR: Failed to fetch profiles" >&2
         return 1
     fi
 
@@ -352,10 +471,7 @@ find_profile_id() {
 
 get_profile_groups() {
     local pid="$1"
-    curl -s --request GET \
-        --url "${API_BASE}/profiles/${pid}/groups" \
-        --header "${AUTH_HEADER}" \
-        --header "accept: application/json"
+    api_call_with_retry "GET" "${API_BASE}/profiles/${pid}/groups"
 }
 
 find_group_pk_by_name() {
@@ -368,25 +484,20 @@ find_group_pk_by_name() {
 delete_group_by_pk() {
     local pid="$1"
     local pk="$2"
-    local code
 
     if [[ "$DRY_RUN" == true ]]; then
         log "  [DRY-RUN] Would delete folder (PK: $pk)"
         return 0
     fi
 
-    code=$(curl -s -o /dev/null -w "%{http_code}" --request DELETE \
-        --url "${API_BASE}/profiles/${pid}/groups/${pk}" \
-        --header "${AUTH_HEADER}")
-
-    [[ "$code" == "200" || "$code" == "204" ]]
+    api_call_with_retry "DELETE" "${API_BASE}/profiles/${pid}/groups/${pk}" >/dev/null
 }
 
 create_group() {
     local pid="$1"
     local name="$2"
     local action="$3"
-    local resp code resp_body pk
+    local resp_body pk
 
     if [[ "$DRY_RUN" == true ]]; then
         log "  [DRY-RUN] Would create group '$name'"
@@ -394,32 +505,21 @@ create_group() {
         return 0
     fi
 
-    resp=$(curl -s --request POST \
-        --url "${API_BASE}/profiles/${pid}/groups" \
-        --header "${AUTH_HEADER}" \
-        --header "content-type: application/json" \
-        --data "{\"name\":\"${name}\",\"action\":${action}}" \
-        -w "\n%{http_code}")
+    resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups" \
+        "{\"name\":\"${name}\",\"action\":${action}}")
 
-    code=$(echo "$resp" | tail -n1)
-    resp_body=$(echo "$resp" | sed '$d')
-
-    if [[ "$code" == "200" || "$code" == "201" ]]; then
-        pk=$(echo "$resp_body" | jq -r '.body.groups[0].PK // .body.groups[0].id // .body.groups[0].pk // empty' 2>/dev/null)
-        [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
-
-        pk=$(echo "$resp_body" | jq -r '.. | objects? | select(has("PK")) | .PK // empty' 2>/dev/null | head -n1)
-        [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
-
-        log "  WARN: Could not extract PK from create response" >&2
+    if [[ $? -ne 0 ]]; then
+        log "  ERROR: Create group failed"
         return 1
     fi
 
-    if echo "$resp_body" | grep -qi "already exists"; then
-        return 2
-    fi
+    pk=$(echo "$resp_body" | jq -r '.body.groups[0].PK // .body.groups[0].id // .body.groups[0].pk // empty' 2>/dev/null)
+    [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
 
-    log "  ERROR: Create group failed (HTTP $code)" >&2
+    pk=$(echo "$resp_body" | jq -r '.. | objects? | select(has("PK")) | .PK // empty' 2>/dev/null | head -n1)
+    [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
+
+    log "  WARN: Could not extract PK from create response" >&2
     return 1
 }
 
@@ -430,7 +530,7 @@ add_all_rules() {
     local total do_val status_val
     local batch_size="$BATCH_SIZE"
     local added=0 batch_num=0 remaining current_batch_size
-    local hostnames body resp code resp_body
+    local hostnames body resp_body
 
     total=$(jq '.rules | length' "$file")
     do_val=$(jq -r '.group.action.do // .rules[0].action.do // 0' "$file")
@@ -454,21 +554,13 @@ add_all_rules() {
 
         body="{\"do\":${do_val},\"status\":${status_val},\"group\":${group_id},\"hostnames\":${hostnames}}"
 
-        resp=$(curl -s --request POST \
-            --url "${API_BASE}/profiles/${pid}/rules" \
-            --header "${AUTH_HEADER}" \
-            --header "content-type: application/json" \
-            --data "$body" \
-            -w "\n%{http_code}")
+        resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/rules" "$body")
 
-        code=$(echo "$resp" | tail -n1)
-        resp_body=$(echo "$resp" | sed '$d')
-
-        if [[ "$code" == "200" || "$code" == "201" ]]; then
+        if [[ $? -eq 0 ]]; then
             added=$((added + current_batch_size))
             log "    Batch $batch_num: $added/$total rules added"
         else
-            log "    ERROR: Batch $batch_num failed (HTTP $code)" >&2
+            log "    ERROR: Batch $batch_num failed" >&2
             return 1
         fi
     done
@@ -588,7 +680,7 @@ list_hagezi() {
     fi
 
     echo ""
-    log "Found $count Hagezi folder(s) — ready to paste into config.toml:"
+    log "Found $count Hagezi folder(s) -- ready to paste into config.toml:"
     echo "═══════════════════════════════════════════════════════════════════════"
     echo ""
     echo "[folders]"
@@ -790,6 +882,9 @@ main() {
 
     # --- Load TOML configuration ---
     load_config "$CONFIG_FILE"
+
+    # --- Validate parsed config ---
+    validate_config
 
     # --- Now validate things that depend on loaded config ---
     validate_target_profile

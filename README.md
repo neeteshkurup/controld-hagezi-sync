@@ -1,4 +1,3 @@
-
 # ControlD Hagezi Sync
 
 ![GitHub stars](https://img.shields.io/github/stars/0x11DFE/controld-hagezi-sync?style=flat-square)
@@ -210,6 +209,41 @@ When running manually via **Actions -> Run workflow**, you can specify:
 
 ---
 
+## TOML Parser Limitations
+
+The built-in parser is intentionally minimal. It handles:
+- `[section]` headers
+- `key = "value"` and `"Quoted Key" = "value"`
+- Single-line arrays: `key = ["a", "b"]`
+- Multi-line arrays
+- Booleans: `true` / `false`
+
+It does **not** support:
+- Escaped quotes inside strings (`\"`)
+- Multi-line literal strings (`'''`)
+- Inline tables
+- Date/time types
+
+Keep your config simple and these limitations will not affect you.
+
+---
+
+## Known Limitations
+
+- **Destructive sync:** Folders are deleted and recreated. An interrupted sync may leave a profile without that folder's rules until the next run.
+- **No rule-level diff:** We don't compare individual rules against the existing folder. If Hagezi's JSON hasn't changed, we still delete and recreate.
+- **Bash TOML parser:** See [TOML Parser Limitations](#toml-parser-limitations) above.
+
+---
+
+## Roadmap
+
+- [ ] `--check-update` -- skip sync if Hagezi list hasn't changed since last run
+- [ ] Exponential backoff with `Retry-After` header support
+- [ ] Optional atomic two-phase sync (blocked by ControlD API group rename support)
+
+---
+
 ## Troubleshooting
 
 | Issue | Solution |
@@ -217,7 +251,7 @@ When running manually via **Actions -> Run workflow**, you can specify:
 | `Missing dependencies` | Install `curl` and `jq`. |
 | `Profile not found by name` | Ensure the profile name in `config.toml` matches exactly (case-sensitive) in ControlD. |
 | `Failed to fetch profiles (HTTP 401)` | Your API token is invalid or expired. Generate a new one from the ControlD dashboard. |
-| `Batch X failed (HTTP 4xx/5xx)` | Usually transient. Re-run the workflow. If persistent, check ControlD API status. |
+| `Batch X failed (HTTP 4xx/5xx)` | The script retries automatically with exponential backoff. If persistent, check ControlD API status. |
 | `--list-hagezi shows rate limit` | GitHub unauthenticated API limit is 60/hr. Set `GITHUB_TOKEN` or wait. |
 
 ---
