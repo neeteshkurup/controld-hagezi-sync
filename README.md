@@ -115,6 +115,7 @@ All behavior is driven by `config.toml`.
 |---|---|---|
 | `[settings]` | `api_token` | ControlD API Write Token. Prefer `CONTROLD_API_TOKEN` env var. |
 | `[settings]` | `dry_run` | Set to `true` to preview without changes. |
+| `[settings]` | `show_freshness` | Set to `false` to skip the upstream freshness report after sync. Useful in CI to avoid GitHub's unauthenticated rate limit (60 req/hr). |
 | `[profiles]` | `names` | Array of exact ControlD profile names to sync. |
 | `[folders]` | `"Name"` | Maps a friendly folder name to its Hagezi JSON URL. |
 | `[profile_folders]` | `<profile>` | Array of folder names to sync to that profile. |
@@ -139,6 +140,15 @@ Work = ["Badware Hoster", "Most Abused TLDs"]
 Tesla = ["Badware Hoster", "My Custom List"]
 ```
 
+### Example: Disabling freshness report for CI
+
+```toml
+[settings]
+# Uncomment to skip the upstream freshness report at the end of each sync run.
+# This avoids unauthenticated GitHub API calls (60 req/hr limit) — useful for CI.
+# show_freshness = false
+```
+
 ---
 
 ## CLI Options
@@ -150,6 +160,8 @@ Tesla = ["Badware Hoster", "My Custom List"]
   --dry-run          Preview changes without modifying ControlD
   --profile NAME     Sync only one profile
   --list-hagezi      List available Hagezi folders (ready for config.toml)
+  --last-updated     Show the last updated date for configured folders and exit
+  --no-freshness     Skip the upstream freshness report at end of sync
   -h, --help         Show help
 ```
 
@@ -167,6 +179,12 @@ CONFIG_FILE=prod.toml ./sync-hagezi.sh
 
 # List available Hagezi sources
 ./sync-hagezi.sh --list-hagezi
+
+# Check upstream freshness without syncing
+./sync-hagezi.sh --last-updated
+
+# Skip freshness report (CI-friendly)
+./sync-hagezi.sh --no-freshness
 ```
 
 ---
@@ -219,7 +237,7 @@ The built-in parser is intentionally minimal. It handles:
 - Booleans: `true` / `false`
 
 It does **not** support:
-- Escaped quotes inside strings (`\"`)
+- Escaped quotes inside strings (`\\"`)
 - Multi-line literal strings (`'''`)
 - Inline tables
 - Date/time types
@@ -238,6 +256,10 @@ Keep your config simple and these limitations will not affect you.
 
 ## Roadmap
 
+- [x] `--last-updated` — check upstream freshness without syncing (v1.3.0)
+- [x] `--no-freshness` / `show_freshness` setting — skip GitHub API calls in CI (v1.3.4)
+- [x] Quote-aware TOML comment stripping — `#` inside strings no longer breaks parsing (v1.3.4)
+- [x] Proper `Retry-After` header parsing on ControlD API rate limits (v1.3.4)
 - [ ] `--check-update` — skip sync if Hagezi lists haven't changed (high priority)
 - [ ] Optional atomic two-phase sync (blocked by ControlD API improvements)
 

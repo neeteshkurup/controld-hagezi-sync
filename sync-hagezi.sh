@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD Hagezi Folder Auto-Sync
-# Version: 1.2.0
+# Version: 1.4.0
 # Description: Syncs Hagezi DNS blocklist folders to ControlD profiles.
 #              Pure Bash. No Python. TOML-driven configuration.
 # Requirements: bash 4.3+, curl, jq
@@ -9,101 +9,67 @@
 # =============================================================================
 
 set -o pipefail
+shopt -s extglob
 
-VERSION="1.2.0"
+VERSION="1.4.0"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
 CONFIG_FILE="${CONFIG_FILE:-config.toml}"
-
-# API token priority: env var > config file
 API_TOKEN="${CONTROLD_API_TOKEN:-}"
-
-# ControlD API base URL
 API_BASE="https://api.controld.com"
 
-# GitHub API for checking last commit date of Hagezi files
-HAGEZI_API="https://api.github.com/repos/hagezi/dns-blocklists/commits"
-
-# Batch size for rule insertion (ControlD API limit)
 BATCH_SIZE=500
-
-# API retry configuration
 API_RETRIES=3
 API_BACKOFF_BASE=2
 
 # ---------------------------------------------------------------------------
-# GLOBALS (populated by load_config)
+# GLOBALS
 # ---------------------------------------------------------------------------
 
 declare -a PROFILE_NAMES
-declare -A HAGEZI_FOLDERS
-declare -A PROFILE_FOLDERS
+declare -A HAGEZI_FOLDERS PROFILE_FOLDERS _TOML_VALS
 
-# CLI flags
 DRY_RUN=false
+ACTION_LAST_UPDATED=false
+SHOW_FRESHNESS=true
 TARGET_PROFILE=""
-
-# Counters
 SUCCESS_COUNT=0
-SKIPPED_COUNT=0
 FAILED_COUNT=0
-
-# Temp directory
 TMPDIR=""
 
 # ---------------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------------
 
-log() {
-    printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
-}
+log() { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2; }
 
 # ---------------------------------------------------------------------------
 # API RETRY HELPER
 # ---------------------------------------------------------------------------
 
-# Make an API call with automatic retry on 429/5xx errors.
-# Usage: api_call_with_retry <method> <url> [data]
-# Prints response body on success, returns 1 on failure.
 api_call_with_retry() {
-    local method="$1"
-    local url="$2"
-    local data="${3:-}"
-    local retries=$API_RETRIES
-    local delay=$API_BACKOFF_BASE
-    local resp code body retry_after
+    local method="$1" url="$2" data="${3:-}"
+    local retries=$API_RETRIES delay=$API_BACKOFF_BASE
+    local body_file header_file code body retry_after
+    local curl_opts=("--request" "$method" "--url" "$url" "--header" "Authorization: Bearer ${API_TOKEN}")
+
+    [[ -n "$data" ]] && curl_opts+=("--header" "content-type: application/json" "--data" "$data")
+
+    body_file=$(mktemp)
+    header_file=$(mktemp)
+    trap 'rm -f "$body_file" "$header_file"' RETURN
 
     while true; do
-        if [[ -n "$data" ]]; then
-            resp=$(curl -s --request "$method" \
-                --url "$url" \
-                --header "${AUTH_HEADER}" \
-                --header "content-type: application/json" \
-                --data "$data" \
-                -w "\n%{http_code}")
-        else
-            resp=$(curl -s --request "$method" \
-                --url "$url" \
-                --header "${AUTH_HEADER}" \
-                -w "\n%{http_code}")
-        fi
+        code=$(curl -s -o "$body_file" -D "$header_file" -w "%{http_code}" "${curl_opts[@]}")
+        body=$(cat "$body_file")
 
-        code=$(echo "$resp" | tail -n1)
-        body=$(echo "$resp" | sed '$d')
+        [[ "$code" =~ ^(200|201|204)$ ]] && { echo "$body"; return 0; }
 
-        # Success codes
-        if [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]]; then
-            echo "$body"
-            return 0
-        fi
-
-        # Rate limited — respect Retry-After if present
         if [[ "$code" == "429" ]]; then
-            retry_after=$(echo "$resp" | grep -i "^retry-after:" | awk '{print $2}' | tr -d '\r' 2>/dev/null)
+            retry_after=$(awk '/^[Rr]etry-[Aa]fter:/ {print $2}' "$header_file" | tr -d '\r\n')
             if [[ -n "$retry_after" && "$retry_after" =~ ^[0-9]+$ ]]; then
                 log "  WARN: Rate limited (429), waiting ${retry_after}s..."
                 sleep "$retry_after"
@@ -112,87 +78,73 @@ api_call_with_retry() {
                 sleep "$delay"
                 delay=$((delay * 2))
             fi
-        # Server errors — exponential backoff
         elif [[ "$code" == 5* ]]; then
             log "  WARN: Server error (HTTP $code), retrying in ${delay}s..."
             sleep "$delay"
             delay=$((delay * 2))
-        # Client errors — don't retry (except 429 handled above)
         else
             log "  ERROR: API call failed (HTTP $code)"
             return 1
         fi
 
-        retries=$((retries - 1))
-        if [[ "$retries" -le 0 ]]; then
-            log "  ERROR: Max retries exceeded for $method $url"
-            return 1
-        fi
+        ((retries--))
+        [[ "$retries" -le 0 ]] && { log "  ERROR: Max retries exceeded for $method $url"; return 1; }
     done
 }
 
 # ---------------------------------------------------------------------------
 # TOML PARSER (Pure Bash)
 # ---------------------------------------------------------------------------
+# NOTE: Pragmatic parser. Handles sections, quoted/unquoted keys, strings,
+#       booleans, and multi-line arrays. Does NOT support escaped quotes,
+#       multi-line literals, inline tables, or date/time types.
+# ---------------------------------------------------------------------------
 
-# Internal associative array for parsed TOML values.
-# Keys are formatted as "section|key".
-# Arrays are stored as pipe-delimited strings.
-declare -A _TOML_VALS
-
-# Parse a TOML file into _TOML_VALS.
-# Supports: [section], key = "val", key = ["a", "b"], key = true/false
-#           quoted keys: "Key Name" = "value"
-# Limitations: no escaped quotes, no multi-line literals, no inline tables,
-#              no date/time types, comments stripped naively.
 parse_toml() {
-    local file="$1"
-    local line section="" key raw_val val
+    local file="$1" line section="" key raw_val val array_buf="" inner
     local -i in_array=0
-    local array_buf=""
+    local open_chars close_chars
 
-    # Clear previous state
     _TOML_VALS=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip pure comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ -z "${line// /}" ]] && continue
 
-        # Detect section header: [section] or [section.sub]
+        # Strip inline comments (quote-aware: # inside "..." is preserved)
+        local out="" ch in_q=0
+        local -i j line_len=${#line}
+        for ((j=0; j<line_len; j++)); do
+            ch="${line:$j:1}"
+            [[ "$ch" == '"' ]] && ((in_q ^= 1))
+            if [[ "$ch" == '#' && "$in_q" -eq 0 ]]; then
+                break
+            fi
+            out+="$ch"
+        done
+        line="$out"
+        [[ -z "${line// /}" ]] && continue
+
         if [[ "$line" =~ ^\[([^\]]+)\][[:space:]]*$ ]]; then
             section="${BASH_REMATCH[1]}"
             continue
         fi
 
-        # Skip inline comments (naive: everything after unquoted #)
-        # This is a known limitation — escaped # inside strings will break
-        line="${line%%#*}"
-        [[ -z "${line// /}" ]] && continue
-
-        # Are we inside a multi-line array?
         if [[ "$in_array" -eq 1 ]]; then
-            array_buf="${array_buf}${line}"
-            local open close
-            open=$(tr -cd '[' <<< "$array_buf" | wc -c)
-            close=$(tr -cd ']' <<< "$array_buf" | wc -c)
-            if [[ "$close" -ge "$open" ]]; then
+            array_buf+="$line"
+            open_chars="${array_buf//[^\[]/}"; close_chars="${array_buf//[^\]]/}"
+            [[ "${#close_chars}" -ge "${#open_chars}" ]] && {
                 in_array=0
-                local inner="${array_buf#*[}"
-                inner="${inner%]*}"
-                val=$(parse_toml_array "$inner")
-                _TOML_VALS["${section}|${key}"]="$val"
+                inner="${array_buf#*[}"; inner="${inner%]*}"
+                _TOML_VALS["${section}|${key}"]=$(parse_toml_array "$inner")
                 array_buf=""
-            fi
+            }
             continue
         fi
 
-        # Key = value (quoted key or unquoted key)
-        # Try quoted key first: "Key Name" = "value"
+        # Try quoted key first, then unquoted key
         if [[ "$line" =~ ^[[:space:]]*\"([^\"]+)\"[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
             key="${BASH_REMATCH[1]}"
             raw_val="${BASH_REMATCH[2]}"
-        # Unquoted key: key = value
         elif [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$ ]]; then
             key="${BASH_REMATCH[1]}"
             raw_val="${BASH_REMATCH[2]}"
@@ -200,22 +152,15 @@ parse_toml() {
             continue
         fi
 
-        # Trim trailing whitespace from raw_val
-        raw_val="${raw_val%% }"
-        raw_val="${raw_val%%	}"
+        # Clean trailing whitespace
+        raw_val="${raw_val%%+([[:space:]])}"
 
-        # Is it the start of a multi-line array?
         if [[ "$raw_val" == \[* ]]; then
             array_buf="$raw_val"
-            local open close
-            open=$(tr -cd '[' <<< "$array_buf" | wc -c)
-            close=$(tr -cd ']' <<< "$array_buf" | wc -c)
-            if [[ "$close" -ge "$open" ]]; then
-                # Single-line array
-                local inner="${array_buf#*[}"
-                inner="${inner%]*}"
-                val=$(parse_toml_array "$inner")
-                _TOML_VALS["${section}|${key}"]="$val"
+            open_chars="${array_buf//[^\[]/}"; close_chars="${array_buf//[^\]]/}"
+            if [[ "${#close_chars}" -ge "${#open_chars}" ]]; then
+                inner="${array_buf#*[}"; inner="${inner%]*}"
+                _TOML_VALS["${section}|${key}"]=$(parse_toml_array "$inner")
                 array_buf=""
             else
                 in_array=1
@@ -223,222 +168,98 @@ parse_toml() {
             continue
         fi
 
-        # String value (quoted)
-        if [[ "$raw_val" =~ ^\"(.*)\"$ ]]; then
-            val="${BASH_REMATCH[1]}"
-            _TOML_VALS["${section}|${key}"]="$val"
-            continue
+        # Strip surrounding quotes from string values
+        if [[ "$raw_val" == \"*\" ]]; then
+            val="${raw_val#\"}"
+            val="${val%\"}"
+        else
+            val="$raw_val"
         fi
-
-        # Boolean / bare words
-        if [[ "$raw_val" == "true" || "$raw_val" == "false" ]]; then
-            _TOML_VALS["${section}|${key}"]="$raw_val"
-            continue
-        fi
-
-        # Number or other bare value
-        _TOML_VALS["${section}|${key}"]="$raw_val"
+        _TOML_VALS["${section}|${key}"]="$val"
     done < "$file"
 }
 
-# Parse a TOML array body like: "a", "b", "c"
-# Returns pipe-delimited string: a|b|c
-# Limitation: does not handle escaped quotes inside strings.
 parse_toml_array() {
-    local inner="$1"
+    local inner="$1" buf="" ch
     local -a items=()
-    local item buf="" in_quotes=0
-    local -i i len
-    len=${#inner}
+    local -i in_quotes=0 i len=${#inner}
 
     for ((i=0; i<len; i++)); do
-        local ch="${inner:$i:1}"
+        ch="${inner:$i:1}"
         if [[ "$ch" == '"' ]]; then
-            if [[ "$in_quotes" -eq 0 ]]; then
-                in_quotes=1
-            else
-                items+=("$buf")
-                buf=""
-                in_quotes=0
-            fi
+            ((in_quotes ^= 1))
+            [[ "$in_quotes" -eq 0 ]] && { items+=("$buf"); buf=""; }
             continue
         fi
-        if [[ "$in_quotes" -eq 1 ]]; then
-            buf="${buf}${ch}"
-        fi
+        [[ "$in_quotes" -eq 1 ]] && buf+="$ch"
     done
 
-    # Join with pipe
-    local result=""
-    local first=1
-    for item in "${items[@]}"; do
-        if [[ "$first" -eq 1 ]]; then
-            result="$item"
-            first=0
-        else
-            result="${result}|${item}"
-        fi
-    done
-    echo "$result"
+    local IFS="|"
+    echo "${items[*]}"
 }
 
-# Get a TOML value by section and key.
-# Echoes the value, or empty string if not found.
-toml_get() {
-    local section="$1"
-    local key="$2"
-    echo "${_TOML_VALS["${section}|${key}"]:-}"
-}
+toml_get() { echo "${_TOML_VALS["$1|$2"]:-}"; }
 
-# Get a TOML array by section and key as a newline-separated list.
 toml_get_array() {
-    local section="$1"
-    local key="$2"
-    local raw
-    raw="${_TOML_VALS["${section}|${key}"]:-}"
-    [[ -z "$raw" ]] && return
-    IFS='|' read -ra items <<< "$raw"
-    local item
-    for item in "${items[@]}"; do
-        echo "$item"
-    done
+    local raw="${_TOML_VALS["$1|$2"]:-}"
+    [[ -n "$raw" ]] && tr '|' '\n' <<< "$raw"
 }
 
-# Load configuration from TOML into global arrays
 load_config() {
     local cfg="$1"
 
     if [[ ! -f "$cfg" ]]; then
-        if [[ -f "${cfg}.example" ]]; then
-            log "WARN: $cfg not found, falling back to ${cfg}.example"
-            cfg="${cfg}.example"
-        else
-            log "ERROR: Configuration file not found: $cfg"
-            log "       Copy config.toml.example to config.toml and customize it."
-            exit 1
-        fi
+        [[ -f "${cfg}.example" ]] && { log "WARN: $cfg not found, falling back to ${cfg}.example"; cfg="${cfg}.example"; } \
+        || { log "ERROR: Configuration file not found: $cfg"; exit 1; }
     fi
 
     parse_toml "$cfg"
 
-    # --- API token ---
-    local cfg_token
-    cfg_token=$(toml_get "settings" "api_token")
-    if [[ -z "$API_TOKEN" && -n "$cfg_token" ]]; then
-        API_TOKEN="$cfg_token"
-    fi
+    API_TOKEN="${API_TOKEN:-$(toml_get "settings" "api_token")}"
+    [[ "$(toml_get "settings" "dry_run")" == "true" ]] && DRY_RUN=true
+    [[ "$(toml_get "settings" "show_freshness")" == "false" ]] && SHOW_FRESHNESS=false
 
-    # --- Dry run from config (CLI can override) ---
-    local cfg_dry
-    cfg_dry=$(toml_get "settings" "dry_run")
-    [[ "$cfg_dry" == "true" ]] && DRY_RUN=true
+    readarray -t PROFILE_NAMES <<< "$(toml_get_array "profiles" "names")"
+    [[ ${#PROFILE_NAMES[@]} -eq 0 || -z "${PROFILE_NAMES[0]}" ]] && { log "ERROR: No profiles configured in $cfg"; exit 1; }
 
-    # --- Profile names ---
-    local names_raw
-    names_raw=$(toml_get_array "profiles" "names")
-    if [[ -z "$names_raw" ]]; then
-        log "ERROR: No profiles configured in $cfg"
-        exit 1
-    fi
-    readarray -t PROFILE_NAMES <<< "$names_raw"
-
-    # --- Folders: read all keys in [folders] section ---
-    HAGEZI_FOLDERS=()
-    local key
+    HAGEZI_FOLDERS=(); PROFILE_FOLDERS=()
     for key in "${!_TOML_VALS[@]}"; do
-        [[ "$key" == folders\|* ]] || continue
-        local fname="${key#folders\|}"
-        local furl="${_TOML_VALS[$key]}"
-        HAGEZI_FOLDERS["$fname"]="$furl"
+        [[ "$key" == folders\|* ]] && HAGEZI_FOLDERS["${key#folders\|}"]="${_TOML_VALS[$key]}"
+        [[ "$key" == profile_folders\|* ]] && PROFILE_FOLDERS["${key#profile_folders\|}"]="${_TOML_VALS[$key]}"
     done
 
-    if [[ ${#HAGEZI_FOLDERS[@]} -eq 0 ]]; then
-        log "ERROR: No folders configured in $cfg"
-        exit 1
-    fi
-
-    # --- Profile -> Folder mappings ---
-    PROFILE_FOLDERS=()
-    for key in "${!_TOML_VALS[@]}"; do
-        [[ "$key" == profile_folders\|* ]] || continue
-        local pname="${key#profile_folders\|}"
-        local folders_pipe="${_TOML_VALS[$key]}"
-        PROFILE_FOLDERS["$pname"]="$folders_pipe"
-    done
-
-    if [[ ${#PROFILE_FOLDERS[@]} -eq 0 ]]; then
-        log "ERROR: No profile_folders mappings in $cfg"
-        exit 1
-    fi
+    [[ ${#HAGEZI_FOLDERS[@]} -eq 0 ]] && { log "ERROR: No folders configured in $cfg"; exit 1; }
+    [[ ${#PROFILE_FOLDERS[@]} -eq 0 ]] && { log "ERROR: No profile_folders mappings in $cfg"; exit 1; }
 }
 
-# Validate parsed configuration for common errors.
-# Catches malformed URLs and unmapped profiles.
 validate_config() {
-    local key url
-    local has_errors=0
-
-    # Validate folder URLs
+    local key url has_errors=0 pname p found
     for key in "${!_TOML_VALS[@]}"; do
         [[ "$key" == folders\|* ]] || continue
         url="${_TOML_VALS[$key]}"
-        if [[ -z "$url" ]]; then
-            log "ERROR: Empty URL for [$key]"
-            has_errors=1
-        elif [[ ! "$url" =~ ^https?:// ]]; then
-            log "ERROR: Invalid URL in [$key]: $url (must start with http:// or https://)"
-            has_errors=1
-        fi
+        [[ -z "$url" ]] && { log "ERROR: Empty URL for [$key]"; has_errors=1; continue; }
+        [[ ! "$url" =~ ^https?:// ]] && { log "ERROR: Invalid URL in [$key]: $url"; has_errors=1; }
     done
 
-    # Warn about profiles with no folder mappings
-    local pname
     for pname in "${PROFILE_NAMES[@]}"; do
-        if [[ -z "${PROFILE_FOLDERS[$pname]}" ]]; then
-            log "WARN: Profile '$pname' has no [profile_folders] mapping -- will be skipped"
-        fi
+        [[ -z "${PROFILE_FOLDERS[$pname]}" ]] && log "WARN: Profile '$pname' has no [profile_folders] mapping -- will be skipped"
     done
 
-    # Check for profile_folders mappings that reference unknown profiles
     for key in "${!_TOML_VALS[@]}"; do
         [[ "$key" == profile_folders\|* ]] || continue
-        pname="${key#profile_folders\|}"
-        local found=0
-        local p
-        for p in "${PROFILE_NAMES[@]}"; do
-            if [[ "$p" == "$pname" ]]; then
-                found=1
-                break
-            fi
-        done
-        if [[ "$found" -eq 0 ]]; then
-            log "WARN: [profile_folders] has mapping for '$pname' but it's not in [profiles] names"
-        fi
+        pname="${key#profile_folders\|}"; found=0
+        for p in "${PROFILE_NAMES[@]}"; do [[ "$p" == "$pname" ]] && { found=1; break; }; done
+        [[ "$found" -eq 0 ]] && log "WARN: [profile_folders] has mapping for '$pname' but it's not in [profiles] names"
     done
 
-    if [[ "$has_errors" -ne 0 ]]; then
-        log "FATAL: Configuration validation failed"
-        exit 1
-    fi
+    [[ "$has_errors" -ne 0 ]] && { log "FATAL: Configuration validation failed"; exit 1; }
 }
-
-# ---------------------------------------------------------------------------
-# DEPENDENCY CHECKS
-# ---------------------------------------------------------------------------
 
 check_deps() {
     local missing=()
     command -v curl &>/dev/null || missing+=("curl")
     command -v jq   &>/dev/null || missing+=("jq")
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log "ERROR: Missing dependencies: ${missing[*]}"
-        log "Install with:"
-        log "  Debian/Ubuntu: sudo apt install ${missing[*]}"
-        log "  macOS:         brew install ${missing[*]}"
-        log "  Termux:        pkg install ${missing[*]}"
-        exit 1
-    fi
+    [[ ${#missing[@]} -gt 0 ]] && { log "ERROR: Missing dependencies: ${missing[*]}"; exit 1; }
 }
 
 # ---------------------------------------------------------------------------
@@ -447,246 +268,92 @@ check_deps() {
 
 get_all_profiles() {
     local body
-    body=$(api_call_with_retry "GET" "${API_BASE}/profiles")
-    if [[ $? -ne 0 ]]; then
-        log "ERROR: Failed to fetch profiles" >&2
-        return 1
-    fi
-
-    if ! echo "$body" | jq -e '.body.profiles' >/dev/null 2>&1; then
-        log "ERROR: No profiles found in account" >&2
-        return 1
-    fi
-
+    body=$(api_call_with_retry "GET" "${API_BASE}/profiles") || return 1
+    jq -e '.body.profiles' >/dev/null 2>&1 <<< "$body" || { log "ERROR: No profiles found" >&2; return 1; }
     echo "$body"
-    return 0
 }
 
-find_profile_id() {
-    local json="$1"
-    local name="$2"
-    echo "$json" | jq -r --arg n "$name" \
-        '.body.profiles[] | select(.name == $n) | .PK' 2>/dev/null | head -n1
-}
-
-get_profile_groups() {
-    local pid="$1"
-    api_call_with_retry "GET" "${API_BASE}/profiles/${pid}/groups"
-}
-
-find_group_pk_by_name() {
-    local groups_json="$1"
-    local group_name="$2"
-    echo "$groups_json" | jq -r --arg g "$group_name" \
-        '.body.groups[] | select(.group == $g) | .PK' 2>/dev/null | head -n1
-}
+find_profile_id() { jq -r --arg n "$2" '.body.profiles[] | select(.name == $n) | .PK' 2>/dev/null <<< "$1" | head -n1; }
+get_profile_groups() { api_call_with_retry "GET" "${API_BASE}/profiles/$1/groups"; }
+find_group_pk_by_name() { jq -r --arg g "$2" '.body.groups[] | select(.group == $g) | .PK' 2>/dev/null <<< "$1" | head -n1; }
 
 delete_group_by_pk() {
-    local pid="$1"
-    local pk="$2"
-
-    if [[ "$DRY_RUN" == true ]]; then
-        log "  [DRY-RUN] Would delete folder (PK: $pk)"
-        return 0
-    fi
-
-    api_call_with_retry "DELETE" "${API_BASE}/profiles/${pid}/groups/${pk}" >/dev/null
+    [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would delete folder (PK: $2)"; return 0; }
+    api_call_with_retry "DELETE" "${API_BASE}/profiles/$1/groups/$2" >/dev/null
 }
 
 create_group() {
-    local pid="$1"
-    local name="$2"
-    local action="$3"
-    local resp_body pk
+    local pid="$1" name="$2" action="$3" resp_body pk
+    [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would create group '$name'"; echo "DRYRUN"; return 0; }
 
-    if [[ "$DRY_RUN" == true ]]; then
-        log "  [DRY-RUN] Would create group '$name'"
-        echo "DRYRUN"
-        return 0
-    fi
+    resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups" "{\"name\":\"${name}\",\"action\":${action}}") || return 1
 
-    resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups" \
-        "{\"name\":\"${name}\",\"action\":${action}}")
-
-    if [[ $? -ne 0 ]]; then
-        log "  ERROR: Create group failed"
-        return 1
-    fi
-
-    pk=$(echo "$resp_body" | jq -r '.body.groups[0].PK // .body.groups[0].id // .body.groups[0].pk // empty' 2>/dev/null)
+    pk=$(jq -r '.body.groups[0].PK // .body.groups[0].id // .body.groups[0].pk // empty' 2>/dev/null <<< "$resp_body")
     [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
 
-    pk=$(echo "$resp_body" | jq -r '.. | objects? | select(has("PK")) | .PK // empty' 2>/dev/null | head -n1)
+    pk=$(jq -r '.. | objects? | select(has("PK")) | .PK // empty' 2>/dev/null <<< "$resp_body" | head -n1)
     [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
 
-    log "  WARN: Could not extract PK from create response" >&2
-    return 1
+    log "  WARN: Could not extract PK from create response"; return 1
 }
 
 add_all_rules() {
-    local pid="$1"
-    local group_id="$2"
-    local file="$3"
-    local total do_val status_val
-    local batch_size="$BATCH_SIZE"
-    local added=0 batch_num=0 remaining current_batch_size
-    local hostnames body resp_body
+    local pid="$1" group_id="$2" file="$3" total do_val status_val batch_num=0 added=0
 
     total=$(jq '.rules | length' "$file")
     do_val=$(jq -r '.group.action.do // .rules[0].action.do // 0' "$file")
     status_val=$(jq -r '.group.action.status // .rules[0].action.status // 1' "$file")
 
-    if [[ "$DRY_RUN" == true ]]; then
-        log "  [DRY-RUN] Would add $total rules in batches of $batch_size"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would add $total rules"; return 0; }
+    log "  Adding $total rules in batches of $BATCH_SIZE..."
 
-    log "  Adding $total rules in batches of $batch_size..."
+    while (( added < total )); do
+        ((batch_num++))
+        local current_batch_size=$(( total - added < BATCH_SIZE ? total - added : BATCH_SIZE ))
 
-    while [[ "$added" -lt "$total" ]]; do
-        batch_num=$((batch_num + 1))
-        remaining=$((total - added))
-        current_batch_size=$batch_size
-        [[ "$remaining" -lt "$batch_size" ]] && current_batch_size=$remaining
-
-        hostnames=$(jq --argjson start "$added" --argjson count "$current_batch_size" \
-            '[.rules[$start:$start+$count][].PK]' "$file")
-
+        local hostnames body
+        hostnames=$(jq --argjson start "$added" --argjson count "$current_batch_size" '[.rules[$start:$start+$count][].PK]' "$file")
         body="{\"do\":${do_val},\"status\":${status_val},\"group\":${group_id},\"hostnames\":${hostnames}}"
 
-        resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/rules" "$body")
-
-        if [[ $? -eq 0 ]]; then
-            added=$((added + current_batch_size))
-            log "    Batch $batch_num: $added/$total rules added"
-        else
-            log "    ERROR: Batch $batch_num failed" >&2
-            return 1
-        fi
+        api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/rules" "$body" >/dev/null || { log "    ERROR: Batch $batch_num failed"; return 1; }
+        ((added += current_batch_size))
+        log "    Batch $batch_num: $added/$total rules added"
     done
-
-    log "  OK: All $total rules added"
-    return 0
+    log "  OK: All $total rules added"; return 0
 }
 
 # ---------------------------------------------------------------------------
-# HAGEZI DOWNLOAD HELPERS
+# HAGEZI GITHUB HELPERS
 # ---------------------------------------------------------------------------
 
 download_folder() {
-    local url="$1"
-    local out="$2"
-    local code
-
-    code=$(curl -sL -o "$out" -w "%{http_code}" "$url")
-
-    if [[ "$code" == "200" ]] && jq empty "$out" 2>/dev/null; then
-        return 0
-    fi
-
-    rm -f "$out"
-    return 1
+    [[ "$(curl -sL -o "$2" -w "%{http_code}" "$1")" == "200" ]] && jq empty "$2" 2>/dev/null && return 0
+    rm -f "$2"; return 1
 }
-
-get_github_last_updated() {
-    local filename="$1"
-    local api_url resp date_str formatted_date target_epoch current_epoch diff
-
-    api_url="${HAGEZI_API}?path=controld/${filename}&page=1&per_page=1"
-    resp=$(curl -sL --header "Accept: application/vnd.github.v3+json" "$api_url")
-    date_str=$(echo "$resp" | jq -r '.[0].commit.committer.date // .[0].commit.author.date // "unknown"' 2>/dev/null)
-
-    if [[ "$date_str" == "null" || -z "$date_str" || "$date_str" == "unknown" ]]; then
-        echo "unknown"
-        return 0
-    fi
-
-    formatted_date=$(echo "$date_str" | sed 's/T/ /; s/Z//')
-    target_epoch=$(date -d "$formatted_date" +%s 2>/dev/null)
-
-    if [[ -z "$target_epoch" ]]; then
-        echo "unknown"
-        return 0
-    fi
-
-    current_epoch=$(date +%s)
-    diff=$((current_epoch - target_epoch))
-
-    if [[ $diff -lt 60 ]]; then
-        echo "$diff seconds ago"
-    elif [[ $diff -lt 3600 ]]; then
-        echo "$((diff / 60)) minutes ago"
-    elif [[ $diff -lt 86400 ]]; then
-        echo "$((diff / 3600)) hours ago"
-    else
-        echo "$((diff / 86400)) days ago"
-    fi
-}
-
-# Extract filename from URL path (e.g. https://.../badware-hoster-folder.json)
-get_filename_from_url() {
-    local url="$1"
-    echo "${url##*/}"
-}
-
-# ---------------------------------------------------------------------------
-# LIST HAGEZI FOLDERS (standalone helper)
-# ---------------------------------------------------------------------------
 
 list_hagezi() {
     log "Fetching available Hagezi ControlD folders from GitHub..."
-
     local api_url="https://api.github.com/repos/hagezi/dns-blocklists/contents/controld"
-    local tmpfile
-    tmpfile=$(mktemp)
+    local resp code body count
 
-    local http_code
-    http_code=$(curl -s -w "%{http_code}" \
-        -H "Accept: application/vnd.github.v3+json" \
-        -H "User-Agent: controld-hagezi-sync/${VERSION}" \
-        -o "$tmpfile" \
-        "$api_url")
+    resp=$(curl -s -w "\n%{http_code}" -H "Accept: application/vnd.github.v3+json" -H "User-Agent: controld-hagezi-sync/${VERSION}" "$api_url")
+    code=$(tail -n1 <<< "$resp")
+    body=$(sed '$d' <<< "$resp")
 
-    if [[ "$http_code" != "200" ]]; then
-        rm -f "$tmpfile"
-        if [[ "$http_code" == "403" ]]; then
-            log "ERROR: GitHub API rate limit hit (HTTP 403)."
-            log "       Set a GITHUB_TOKEN env var or wait ~1 hour."
-        elif [[ "$http_code" == "404" ]]; then
-            log "ERROR: Hagezi repo path not found. The directory structure may have changed."
-        else
-            log "ERROR: GitHub API returned HTTP $http_code"
-        fi
+    if [[ "$code" != "200" ]]; then
+        [[ "$code" == "403" ]] && log "ERROR: GitHub API rate limit hit (HTTP 403)."
+        [[ "$code" == "404" ]] && log "ERROR: Hagezi repo path not found."
+        [[ "$code" != "403" && "$code" != "404" ]] && log "ERROR: GitHub API returned HTTP $code"
         return 1
     fi
 
-    local resp
-    resp=$(cat "$tmpfile")
-    rm -f "$tmpfile"
+    count=$(jq '[.[] | select(.type == "file" and (.name | endswith(".json")))] | length' <<< "$body")
+    [[ "$count" -eq 0 ]] && { log "No .json folder definitions found."; return 1; }
 
-    if [[ -z "$resp" || "$resp" == "null" || "$resp" == *'"message"'* ]]; then
-        local msg
-        msg=$(echo "$resp" | jq -r '.message // "Unknown API error"' 2>/dev/null || echo "Unknown API error")
-        log "ERROR: $msg"
-        return 1
-    fi
-
-    local count
-    count=$(echo "$resp" | jq '[.[] | select(.type == "file" and (.name | endswith(".json")))] | length')
-
-    if [[ "$count" -eq 0 ]]; then
-        log "No .json folder definitions found in hagezi/dns-blocklists/controld/"
-        return 1
-    fi
-
-    echo ""
     log "Found $count Hagezi folder(s) -- ready to paste into config.toml:"
-    echo "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-    echo "[folders]"
-    echo ""
+    echo -e "\n[folders]\n"
 
-    echo "$resp" | jq -r '
+    jq -r '
         .[] | select(.type == "file" and (.name | endswith(".json"))) |
         (.name |
             if endswith("-folder.json") then rtrimstr("-folder.json")
@@ -698,250 +365,192 @@ list_hagezi() {
             ($raw | ascii_upcase[0:1]) + ($raw[1:] | ascii_downcase)
         ) as $title |
         "\"\($title)\" = \"https://raw.githubusercontent.com/hagezi/dns-blocklists/main/controld/\(.name)\""
-    ' | sort
+    ' <<< "$body" | sort
+}
 
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-    log "Tip: Copy the lines above into your config.toml under [folders]."
-    log "Then map them per profile in [profile_folders], e.g.:"
-    echo ""
-    echo '  [profile_folders]'
-    echo '  Tesla = ["Badware Hoster", "Spam Tlds"]'
-    echo '  Kids  = ["Badware Hoster", "Spam Idns", "Referral Allow"]'
+show_last_updated() {
+    log "Fetching last updated dates from GitHub API..."
+    local fname url filepath api_url resp code body date_str target_epoch seconds_diff
+
+    for fname in "${!HAGEZI_FOLDERS[@]}"; do
+        url="${HAGEZI_FOLDERS[$fname]}"
+        filepath="${url#*main/}"
+
+        api_url="https://api.github.com/repos/hagezi/dns-blocklists/commits?path=${filepath}&per_page=1"
+        resp=$(curl -s -w "\n%{http_code}" -H "Accept: application/vnd.github.v3+json" -H "User-Agent: controld-hagezi-sync/${VERSION}" "$api_url")
+        code=$(tail -n1 <<< "$resp")
+        body=$(sed '$d' <<< "$resp")
+
+        if [[ "$code" == "200" ]]; then
+            date_str=$(jq -r '.[0].commit.committer.date // empty' <<< "$body")
+            if [[ -n "$date_str" ]]; then
+                target_epoch=$(date -d "$date_str" +%s 2>/dev/null) || target_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$date_str" +%s 2>/dev/null)
+                if [[ -n "$target_epoch" ]]; then
+                    seconds_diff=$(( $(date +%s) - target_epoch ))
+
+                    local rel_time=""
+                    if (( seconds_diff < 60 )); then
+                        if (( seconds_diff == 1 )); then
+                            rel_time="1 second ago"
+                        else
+                            rel_time="${seconds_diff} seconds ago"
+                        fi
+                    elif (( seconds_diff < 3600 )); then
+                        local mins=$(( seconds_diff / 60 ))
+                        if (( mins == 1 )); then
+                            rel_time="1 minute ago"
+                        else
+                            rel_time="${mins} minutes ago"
+                        fi
+                    elif (( seconds_diff < 86400 )); then
+                        local hrs=$(( seconds_diff / 3600 ))
+                        if (( hrs == 1 )); then
+                            rel_time="1 hour ago"
+                        else
+                            rel_time="${hrs} hours ago"
+                        fi
+                    else
+                        local days=$(( seconds_diff / 86400 ))
+                        if (( days == 1 )); then
+                            rel_time="1 day ago"
+                        else
+                            rel_time="${days} days ago"
+                        fi
+                    fi
+
+                    local fmt_date="${date_str/T/ }"
+                    fmt_date="${fmt_date/Z/ UTC}"
+
+                    log "  $fname: $rel_time ($fmt_date)"
+                else
+                    log "  $fname: Unknown (date parse failed)"
+                fi
+            else
+                log "  $fname: Unknown (no commit date)"
+            fi
+        else
+            log "  $fname: Failed (HTTP $code)"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
-# CORE SYNC LOGIC
+# CLI PARSER & MAIN
 # ---------------------------------------------------------------------------
 
-sync_folder() {
-    local pname="$1"
-    local pid="$2"
-    local fname="$3"
-    local cachefile="$4"
-    local groups_json="$5"
-    local name action existing_pk group_id status
-
-    log "  Folder: $fname"
-
-    if [[ -z "$cachefile" || ! -f "$cachefile" ]]; then
-        log "  ERROR: Cached file missing for '$fname'"
-        return 1
-    fi
-
-    name=$(jq -r '.group.group' "$cachefile")
-    action=$(jq -c '.group.action' "$cachefile")
-
-    log "  Checking for existing folder '$name'..."
-    existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
-
-    if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
-        log "  Found existing (PK: $existing_pk), deleting..."
-        if delete_group_by_pk "$pid" "$existing_pk"; then
-            log "  Deleted old folder"
-        else
-            log "  WARN: Delete returned non-2xx, continuing anyway..."
-        fi
-    else
-        log "  No existing folder found"
-    fi
-
-    group_id=$(create_group "$pid" "$name" "$action")
-    status=$?
-
-    if [[ "$status" -eq 0 ]]; then
-        if [[ -z "$group_id" || "$group_id" == "null" ]]; then
-            log "  ERROR: Got empty group ID after creation"
-            return 1
-        fi
-        log "  Group created (ID: $group_id)"
-
-        if add_all_rules "$pid" "$group_id" "$cachefile"; then
-            log "  OK: Folder synced with rules"
-            return 0
-        else
-            log "  WARN: Group created but rule insertion failed"
-            return 0
-        fi
-    elif [[ "$status" -eq 2 ]]; then
-        log "  SKIPPED: Group already exists (delete may have failed)"
-        return 2
-    else
-        return 1
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# CLI PARSER
-# ---------------------------------------------------------------------------
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            --profile)
-                if [[ -z "${2:-}" ]]; then
-                    log "ERROR: --profile requires a profile name"
-                    exit 1
-                fi
-                TARGET_PROFILE="$2"
-                shift 2
-                ;;
-            --config)
-                if [[ -z "${2:-}" ]]; then
-                    log "ERROR: --config requires a file path"
-                    exit 1
-                fi
-                CONFIG_FILE="$2"
-                shift 2
-                ;;
-            --list-hagezi)
-                check_deps
-                list_hagezi
-                exit 0
-                ;;
-            -h|--help)
-                cat << EOF
+show_help() {
+    cat << EOF
 ControlD Hagezi Folder Auto-Sync v${VERSION}
 
 Usage: ./sync-hagezi.sh [OPTIONS]
 
 Options:
-  --config FILE    Use a custom configuration file (default: config.toml)
-  --dry-run        Preview changes without modifying any ControlD data
-  --profile NAME   Sync only the named profile (must match profiles.names)
-  --list-hagezi    List available Hagezi folders (ready for config.toml)
-  -h, --help       Show this help message and exit
+  --config FILE      Use a custom configuration file (default: config.toml)
+  --dry-run          Preview changes without modifying any ControlD data
+  --profile NAME     Sync only the named profile (must match profiles.names)
+  --list-hagezi      List available Hagezi folders (ready for config.toml)
+  --last-updated     Show the last updated date for configured folders and exit
+  --no-freshness     Skip the upstream freshness report at end of sync
+  -h, --help         Show this help message and exit
 
 Environment:
-  CONTROLD_API_TOKEN   Required if not set in config.toml. Your ControlD API
-                       Write Token from https://controld.com/dashboard/api
+  CONTROLD_API_TOKEN   Required if not set in config.toml. Your API Write Token.
   CONFIG_FILE          Default configuration file path.
 
 Examples:
   ./sync-hagezi.sh                    # Sync all profiles
   ./sync-hagezi.sh --profile Tesla    # Sync only Tesla
   ./sync-hagezi.sh --dry-run          # Preview all changes
-  ./sync-hagezi.sh --config my.toml   # Use custom config
   ./sync-hagezi.sh --list-hagezi      # List available Hagezi sources
+  ./sync-hagezi.sh --last-updated     # Check upstream updates for your rules
 EOF
-                exit 0
-                ;;
-            *)
-                log "WARN: Unknown argument: $1"
-                shift
-                ;;
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true; shift ;;
+            --profile) [[ -z "${2:-}" ]] && { log "ERROR: --profile requires a profile name"; exit 1; }; TARGET_PROFILE="$2"; shift 2 ;;
+            --config) [[ -z "${2:-}" ]] && { log "ERROR: --config requires a file path"; exit 1; }; CONFIG_FILE="$2"; shift 2 ;;
+            --list-hagezi) check_deps; list_hagezi; exit 0 ;;
+            --last-updated) ACTION_LAST_UPDATED=true; shift ;;
+            --no-freshness) SHOW_FRESHNESS=false; shift ;;
+            -h|--help|-help) show_help; exit 0 ;;
+            *) log "WARN: Unknown argument: $1"; shift ;;
         esac
     done
 }
 
-# Validate that TARGET_PROFILE exists in PROFILE_NAMES.
-# Must be called AFTER load_config.
-validate_target_profile() {
-    [[ -z "$TARGET_PROFILE" ]] && return 0
+sync_folder() {
+    local pname="$1" pid="$2" fname="$3" cachefile="$4" groups_json="$5" existing_pk group_id
+    log "  Folder: $fname"
 
-    local found=false
-    local p
-    for p in "${PROFILE_NAMES[@]}"; do
-        if [[ "$p" == "$TARGET_PROFILE" ]]; then
-            found=true
-            break
-        fi
-    done
+    [[ ! -f "$cachefile" ]] && { log "  ERROR: Cached file missing"; return 1; }
 
-    if [[ "$found" != true ]]; then
-        log "ERROR: Profile '$TARGET_PROFILE' not found in config"
-        log "Available: ${PROFILE_NAMES[*]}"
-        exit 1
+    local name action
+    name=$(jq -r '.group.group' "$cachefile")
+    action=$(jq -c '.group.action' "$cachefile")
+
+    existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
+    [[ -n "$existing_pk" && "$existing_pk" != "null" ]] && {
+        log "  Found existing '$name' (PK: $existing_pk), replacing..."
+        delete_group_by_pk "$pid" "$existing_pk" || log "  WARN: Delete returned non-2xx"
+    }
+
+    group_id=$(create_group "$pid" "$name" "$action") || return 1
+    [[ -z "$group_id" || "$group_id" == "null" ]] && { log "  ERROR: Got empty group ID"; return 1; }
+
+    log "  Group created (ID: $group_id)"
+
+    if add_all_rules "$pid" "$group_id" "$cachefile"; then
+        log "  OK: Folder synced"
+        return 0
+    else
+        log "  WARN: Group created but rules failed"
+        return 1
     fi
 }
-
-# Validate that the API token is set.
-validate_token() {
-    if [[ -z "$API_TOKEN" ]]; then
-        log "ERROR: ControlD API token is required."
-        log "       Set the CONTROLD_API_TOKEN environment variable, or"
-        log "       add api_token to the [settings] section of $CONFIG_FILE"
-        exit 1
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
 
 main() {
-    local ALL_PROFILES pid pname cachefile status
-
-    # --- Parse CLI flags (only flags, no config-dependent validation yet) ---
     parse_args "$@"
-
-    # --- Load TOML configuration ---
     load_config "$CONFIG_FILE"
-
-    # --- Validate parsed config ---
     validate_config
-
-    # --- Now validate things that depend on loaded config ---
-    validate_target_profile
-    validate_token
-
-    # Clean up token formatting
-    API_TOKEN="${API_TOKEN#Bearer }"
-    AUTH_HEADER="Authorization: Bearer ${API_TOKEN}"
-
-    # --- Validate deps ---
     check_deps
 
-    log "========================================"
-    log "ControlD Hagezi Folder Sync v${VERSION}"
-    [[ "$DRY_RUN" == true ]] && log "MODE: DRY-RUN (no changes will be made)"
-    log "Config: $CONFIG_FILE"
-    log "Profiles: ${PROFILE_NAMES[*]}"
-    log "========================================"
-
-    # --- Fetch profiles ---
-    ALL_PROFILES=$(get_all_profiles)
-    if [[ $? -ne 0 ]]; then
-        log "FATAL: Cannot fetch profile list"
-        exit 1
+    if [[ "$ACTION_LAST_UPDATED" == true ]]; then
+        show_last_updated
+        exit 0
     fi
 
-    # --- Setup temp workspace ---
+    [[ -n "$TARGET_PROFILE" && ! " ${PROFILE_NAMES[*]} " =~ " $TARGET_PROFILE " ]] && { log "ERROR: Profile '$TARGET_PROFILE' not found"; exit 1; }
+    [[ -z "$API_TOKEN" ]] && { log "ERROR: API token required."; exit 1; }
+
+    API_TOKEN="${API_TOKEN#Bearer }"
+
+    log "========================================"
+    log "ControlD Sync v${VERSION}"
+    [[ "$DRY_RUN" == true ]] && log "MODE: DRY-RUN"
+    log "========================================"
+
+    local ALL_PROFILES
+    ALL_PROFILES=$(get_all_profiles) || exit 1
+
     TMPDIR=$(mktemp -d)
     trap "rm -rf '$TMPDIR'" EXIT
     mkdir -p "$TMPDIR/cache"
 
-    # --- Pre-download all unique Hagezi folders ---
     log "Pre-downloading Hagezi folder data..."
-    local fname
     for fname in "${!HAGEZI_FOLDERS[@]}"; do
-        cachefile="$TMPDIR/cache/${fname// /_}.json"
-        if download_folder "${HAGEZI_FOLDERS[$fname]}" "$cachefile"; then
-            log "  Cached: $fname"
-        else
-            log "  FAILED: $fname (will be skipped for all profiles)"
-        fi
+        local cachefile="$TMPDIR/cache/${fname// /_}.json"
+        download_folder "${HAGEZI_FOLDERS[$fname]}" "$cachefile" && log "  Cached: $fname" || log "  FAILED: $fname"
     done
 
-    # --- Process each profile ---
     for pname in "${PROFILE_NAMES[@]}"; do
-        if [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]]; then
-            continue
-        fi
-
+        [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]] && continue
+        local pid
         pid=$(find_profile_id "$ALL_PROFILES" "$pname")
 
-        if [[ -z "$pid" || "$pid" == "null" ]]; then
-            log ""
-            log "--- Profile: $pname ---"
-            log "  ERROR: Profile not found by name"
-            continue
-        fi
+        [[ -z "$pid" || "$pid" == "null" ]] && { log ""; log "--- Profile: $pname ---"; log "  ERROR: Profile not found"; continue; }
 
         log ""
         log "--- Profile: $pname ($pid) ---"
@@ -949,49 +558,33 @@ main() {
         local PROFILE_GROUPS
         PROFILE_GROUPS=$(get_profile_groups "$pid")
 
-        local folder_list
-        folder_list="${PROFILE_FOLDERS[$pname]}"
-        if [[ -z "$folder_list" ]]; then
-            log "  WARN: No folders mapped for this profile"
-            continue
-        fi
+        local folder_list="${PROFILE_FOLDERS[$pname]}"
+        [[ -z "$folder_list" ]] && { log "  WARN: No folders mapped"; continue; }
 
         IFS='|' read -ra TO_SYNC <<< "$folder_list"
-        local f
         for f in "${TO_SYNC[@]}"; do
             sync_folder "$pname" "$pid" "$f" "$TMPDIR/cache/${f// /_}.json" "$PROFILE_GROUPS"
-            status=$?
-
-            case $status in
-                0) SUCCESS_COUNT=$((SUCCESS_COUNT + 1)) ;;
-                2) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)) ;;
-                *) FAILED_COUNT=$((FAILED_COUNT + 1)) ;;
-            esac
+            local status=$?
+            if [[ "$status" -eq 0 ]]; then
+                ((SUCCESS_COUNT++))
+            else
+                ((FAILED_COUNT++))
+            fi
         done
     done
 
-    # --- Summary ---
     log ""
     log "========================================"
-    log "Sync Complete: $SUCCESS_COUNT created, $SKIPPED_COUNT skipped, $FAILED_COUNT failed"
+    log "Sync Complete: $SUCCESS_COUNT succeeded, $FAILED_COUNT failed"
     log "========================================"
 
-    # --- Hagezi freshness report ---
-    log ""
-    log "--- Hagezi Folder Last Updated (GitHub) ---"
-    for folder_name in "${!HAGEZI_FOLDERS[@]}"; do
-        local filename
-        filename=$(get_filename_from_url "${HAGEZI_FOLDERS[$folder_name]}")
-        if [[ -n "$filename" ]]; then
-            log "$folder_name: $(get_github_last_updated "$filename")"
-        fi
-    done
-    log "========================================"
-
-    if [[ $FAILED_COUNT -gt 0 ]]; then
-        exit 1
+    if [[ "$SHOW_FRESHNESS" == true ]]; then
+        log ""
+        log "--- Upstream Freshness (GitHub) ---"
+        show_last_updated
     fi
-    exit 0
+
+    [[ $FAILED_COUNT -gt 0 ]] && exit 1 || exit 0
 }
 
 main "$@"

@@ -26,10 +26,6 @@ jobs:
     timeout-minutes: 30
     
     steps:
-      - name: Random delay
-        if: github.event_name == 'schedule'
-        run: sleep $((RANDOM % 3600))
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -52,6 +48,8 @@ jobs:
           ARGS=()
           [[ -n "${{ github.event.inputs.profile }}" ]] && ARGS+=("--profile" "${{ github.event.inputs.profile }}")
           [[ "${{ github.event.inputs.dry_run }}" == "true" ]] && ARGS+=("--dry-run")
+          # Skip freshness report on scheduled runs to avoid GitHub API rate limits
+          [[ "${{ github.event_name }}" == "schedule" ]] && ARGS+=("--no-freshness")
           ./sync-hagezi.sh "${ARGS[@]}"
 
       - name: Delete logs on success
