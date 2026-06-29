@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 1.6.0
+# Version: 1.6.1
 # Description: Syncs HaGeZi DNS blocklist folders to ControlD profiles.
 #              Features automatic backup/restore fallback for safe rule
 #              replacements. Pure Bash. No Python. TOML-driven configuration.
@@ -12,7 +12,7 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -42,6 +42,10 @@ FAILED_COUNT=0
 TMPDIR=""
 SUMMARY_FILE=""
 
+# Reusable temp files for API calls (populated after TMPDIR is set)
+API_BODY_FILE=""
+API_HDR_FILE=""
+
 # ---------------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------------
@@ -55,23 +59,28 @@ log() { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2; }
 api_call_with_retry() {
     local method="$1" url="$2" data="${3:-}"
     local retries=$API_RETRIES delay=$API_BACKOFF_BASE
-    local body_file header_file code body retry_after
+    local code body retry_after
     local curl_opts=("--request" "$method" "--url" "$url" "--header" "Authorization: Bearer ${API_TOKEN}")
 
     [[ -n "$data" ]] && curl_opts+=("--header" "content-type: application/json" "--data" "$data")
 
-    body_file=$(mktemp)
-    header_file=$(mktemp)
-    trap 'rm -f "$body_file" "$header_file"' RETURN
+    # Initialize reusable temp files on first use (TMPDIR must be set)
+    if [[ -z "$API_BODY_FILE" ]]; then
+        API_BODY_FILE="$TMPDIR/api_body_$$"
+        API_HDR_FILE="$TMPDIR/api_hdr_$$"
+        touch "$API_BODY_FILE" "$API_HDR_FILE"
+    fi
 
     while true; do
-        code=$(curl -s -o "$body_file" -D "$header_file" -w "%{http_code}" "${curl_opts[@]}")
-        body=$(cat "$body_file")
+        : > "$API_BODY_FILE"
+        : > "$API_HDR_FILE"
+        code=$(curl -s -o "$API_BODY_FILE" -D "$API_HDR_FILE" -w "%{http_code}" "${curl_opts[@]}")
+        body=$(cat "$API_BODY_FILE")
 
         [[ "$code" =~ ^(200|201|204)$ ]] && { echo "$body"; return 0; }
 
         if [[ "$code" == "429" ]]; then
-            retry_after=$(awk '/^[Rr]etry-[Aa]fter:/ {print $2}' "$header_file" | tr -d '\r\n')
+            retry_after=$(awk '/^[Rr]etry-[Aa]fter:/ {print $2}' "$API_HDR_FILE" | tr -d '\r\n')
             if [[ -n "$retry_after" && "$retry_after" =~ ^[0-9]+$ ]]; then
                 log "  WARN: Rate limited (429), waiting ${retry_after}s..."
                 sleep "$retry_after"
@@ -405,9 +414,11 @@ backup_group_rules() {
         log "  WARN: API backup returned $rules_count/$expected_count rules, merging with source JSON"
 
         # Build merged backup: API rules as base, source rules filling gaps
-        jq --arg name "$fallback_name" --slurpfile api "$rules_json_file" --slurpfile src "$source_file" '
-            ($api[0] // []) as $api_rules |
-            ($src[0].rules // []) as $src_rules |
+        # Uses streaming input to avoid --slurpfile memory spike
+        jq -n --arg name "$fallback_name" '
+            (input // []) as $api_rules |
+            (input // {}) as $src |
+            ($src.rules // []) as $src_rules |
             # Create a lookup of API rules by PK
             ($api_rules | map({(.PK): .}) | add) as $api_lookup |
             # Merge: prefer API rules (preserve actual ControlD state), fill missing from source
@@ -428,7 +439,7 @@ backup_group_rules() {
                     $merged[] | select(.PK != null) | {PK: .PK, action: .action}
                 ]
             }
-        ' <<< '{}' > "$output_file" || {
+        ' "$rules_json_file" "$source_file" > "$output_file" || {
             log "  WARN: Merge jq failed, using pure source fallback"
             rm -f "$rules_json_file"
             cp "$source_file" "$output_file"
@@ -817,6 +828,11 @@ main() {
         fi
     fi
 
+    # Initialize temp directory early for reusable API call files
+    TMPDIR=$(mktemp -d)
+    trap '[[ -n "${TMPDIR:-}" ]] && rm -rf "$TMPDIR"' EXIT
+    mkdir -p "$TMPDIR/cache"
+
     log "========================================"
     log "ControlD Sync v${VERSION}"
     [[ "$DRY_RUN" == true ]] && log "MODE: DRY-RUN"
@@ -824,10 +840,6 @@ main() {
 
     local ALL_PROFILES
     ALL_PROFILES=$(get_all_profiles) || exit 1
-
-    TMPDIR=$(mktemp -d)
-    trap '[[ -n "${TMPDIR:-}" ]] && rm -rf "$TMPDIR"' EXIT
-    mkdir -p "$TMPDIR/cache"
 
     log "Pre-downloading HaGeZi folder data..."
     local fname cachefile

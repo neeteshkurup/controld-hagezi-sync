@@ -61,6 +61,9 @@ cp config.toml.example config.toml
 ```
 
 3. **Edit `config.toml`** with your ControlD profile names and desired folder mappings.
+
+> ⚠️ **TOML Parser Note:** The built-in parser is intentionally minimal. Keep configs simple: use quoted keys, single-line or multi-line arrays, and basic strings. Avoid escaped quotes inside strings, multi-line literal strings, inline tables, or date/time types. See [TOML Parser Limitations](#toml-parser-limitations) for details.
+
 4. **Commit `config.toml`** to the repo (do **not** put your API token in it).
 5. **Add your API token** as a GitHub secret:
    - Go to **Settings -> Secrets and variables -> Actions -> New repository secret**
@@ -120,7 +123,7 @@ All behavior is driven by `config.toml`.
 |---|---|---|
 | `[settings]` | `api_token` | ControlD API Write Token. Prefer `CONTROLD_API_TOKEN` env var. |
 | `[settings]` | `dry_run` | Set to `true` to preview without changes. |
-| `[settings]` | `show_freshness` | Set to `false` to skip the upstream freshness report after sync. Useful in CI to avoid GitHub's unauthenticated rate limit (60 req/hr). |
+| `[settings]` | `show_freshness` | Set to `false` to skip the upstream freshness report after sync. Useful in CI to avoid GitHub\'s unauthenticated rate limit (60 req/hr). |
 | `[profiles]` | `names` | Array of exact ControlD profile names to sync. |
 | `[folders]` | `"Name"` | Maps a friendly folder name to its HaGeZi JSON URL. |
 | `[profile_folders]` | `` | Array of folder names to sync to that profile. |
@@ -236,8 +239,10 @@ After the run completes, open the **Summary** tab on the workflow run page to se
 6. Rules are inserted in batches of 500 using **jq-native JSON construction** for robust, injection-safe payloads.
 7. If rule injection fails, **automatically restores the original folder from backup**.
 8. Freshness timestamps are parsed with **pure jq** (`fromdateiso8601`) — identical behavior on Linux, macOS, and Termux without platform-specific `date` binaries.
-9. In GitHub Actions, generates a **markdown summary** on the workflow run page with sync results and upstream freshness.
-10. Prints a freshness report showing when each HaGeZi list was last updated on GitHub (local CLI only; Actions gets it in the Summary tab).
+9. **Memory-efficient merges:** During backup fallback, the script streams source JSON via `jq input` instead of `--slurpfile`, cutting memory usage from 3-5x to 1-2x file size.
+10. **I/O-friendly API calls:** Reusable temp files in the retry loop eliminate `mktemp` churn on SD cards and slow storage.
+11. In GitHub Actions, generates a **markdown summary** on the workflow run page with sync results and upstream freshness.
+12. Prints a freshness report showing when each HaGeZi list was last updated on GitHub (local CLI only; Actions gets it in the Summary tab).
 
 ---
 
@@ -256,21 +261,21 @@ It does **not** support:
 - Inline tables
 - Date/time types
 
-Keep your config simple and these limitations will not affect you.
+**Troubleshooting tip:** If your config parses incorrectly, simplify it. Use plain quoted strings, avoid nested quotes, and stick to single-line or simple multi-line arrays. When in doubt, run `./sync-hagezi.sh --dry-run` to validate parsing without making API calls.
 
 ---
 
 ## Known Limitations
 
-- **Destructive sync:** Folders are deleted and recreated. An interrupted sync may leave a profile without that folder's rules until the next run.
-- **No rule-level diff:** We don't compare individual rules against the existing folder. If HaGeZi's JSON hasn't changed, we still delete and recreate.
+- **Destructive sync:** Folders are deleted and recreated. An interrupted sync may leave a profile without that folder\'s rules until the next run.
+- **No rule-level diff:** We don\'t compare individual rules against the existing folder. If HaGeZi\'s JSON hasn\'t changed, we still delete and recreate.
 - **Bash TOML parser:** See [TOML Parser Limitations](#toml-parser-limitations) above.
 
 ---
 
 ## Roadmap
 
-- [ ] `--check-update` — skip sync if HaGeZi lists haven't changed (high priority)
+- [ ] `--check-update` — skip sync if HaGeZi lists haven\'t changed (high priority)
 - [ ] Optional atomic two-phase sync (blocked by ControlD API improvements)
 
 ---
