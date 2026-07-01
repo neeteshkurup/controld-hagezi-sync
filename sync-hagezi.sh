@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.1.0
+# Version: 2.1.1
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq
 # =============================================================================
@@ -9,7 +9,7 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -24,7 +24,7 @@ API_BACKOFF_BASE=2
 
 # Persistent cache for content-based change detection
 SYNC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/controld-hagezi-sync"
-CACHE_VERSION="2"
+CACHE_VERSION="3"
 
 # ---------------------------------------------------------------------------
 # GLOBALS
@@ -661,13 +661,14 @@ import_with_validation() {
                         echo "$new_pk"
                         return 0
                     else
-                        log "  WARN: Rule count mismatch — expected $total_rules, got $actual_count"
-                        break 2
+                        log "  Waiting for rules to populate: $actual_count / $total_rules..."
+                        # Continue polling — do NOT break
                     fi
                 fi
             fi
         done
 
+        # Validation failed (timeout or 0 rules), cleaning up...
         log "  Validation failed (timeout or 0 rules), cleaning up..."
         if [[ -n "$new_pk" && "$new_pk" != "null" ]]; then
             delete_group_by_pk "$pid" "$new_pk" 2>/dev/null || true
@@ -772,6 +773,7 @@ main() {
     local fname cachefile dl_status
     local skipped=0 downloaded=0 failed=0
     local pname pid PROFILE_GROUPS folder_list f status ALL_PROFILES
+    local current_groups_json
 
     parse_args "$@"
     load_config "$CONFIG_FILE"
@@ -863,6 +865,9 @@ main() {
         folder_list="${PROFILE_FOLDERS[$pname]}"
         [[ -z "$folder_list" ]] && { log "  WARN: No folders mapped"; continue; }
 
+        # Fetch profile groups ONCE per profile
+        current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to fetch profile groups"; continue; }
+
         IFS=$'\x1F' read -ra TO_SYNC <<< "$folder_list"
         for f in "${TO_SYNC[@]}"; do
             local cachefile="$WORK_DIR/cache/${f// /_}.json"
@@ -870,14 +875,13 @@ main() {
 
             if [[ "${FOLDER_CHANGED[$f]}" == "false" ]]; then
                 # Cache says unchanged — but validate ControlD still has the rules
-                local existing_pk groups_json_val
-                groups_json_val=$(get_profile_groups "$pid") || { log "  ERROR: Failed to fetch groups"; continue; }
-                existing_pk=$(find_group_pk_by_name "$groups_json_val" "$f")
+                local existing_pk
+                existing_pk=$(find_group_pk_by_name "$current_groups_json" "$f")
 
                 if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
                     local actual_count expected_count
                     expected_count=$(jq '.rules | length' "$cachefile")
-                    actual_count=$(jq --arg pk "$existing_pk" '.body.groups[] | select(.PK == ($pk | tonumber)) | .count' <<< "$groups_json_val")
+                    actual_count=$(jq --arg pk "$existing_pk" '.body.groups[] | select(.PK == ($pk | tonumber)) | .count' <<< "$current_groups_json")
 
                     if [[ -n "$actual_count" && "$actual_count" != "null" && "$actual_count" -gt 0 && "$actual_count" -eq "$expected_count" ]]; then
                         log "  Folder: $f — unchanged upstream and validated in ControlD, skipping sync"
@@ -896,11 +900,12 @@ main() {
             fi
 
             if [[ "$needs_sync" == true ]]; then
-                PROFILE_GROUPS=$(get_profile_groups "$pid") || { log "  ERROR: Failed to fetch profile groups"; continue; }
-                sync_folder "$pname" "$pid" "$f" "$cachefile" "$PROFILE_GROUPS"
+                sync_folder "$pname" "$pid" "$f" "$cachefile" "$current_groups_json"
                 status=$?
                 if [[ "$status" -eq 0 ]]; then
                     SUCCESS_COUNT=$(( SUCCESS_COUNT + 1 ))
+                    # State was modified, refresh the JSON for next folder
+                    current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to refresh profile groups"; continue; }
                 else
                     FAILED_COUNT=$(( FAILED_COUNT + 1 ))
                 fi
