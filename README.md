@@ -266,7 +266,8 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 | `Cache format changed, clearing old cache` | The script auto-invalidates cache when the format changes. This is normal on first run after upgrade. |
 | `CRITICAL ERROR: Rollback failed` | The group is stuck as `{name}_OLD`. Manually rename it back in the ControlD dashboard, or run the sync again. |
 | `Validation failed — expected X rules, ControlD has Y` | ControlD may dedupe or reject some rules. The script accepts a stable count after extended polling. If stable but lower, sync succeeds with a warning. If it stays at 0, the folder may contain rules ControlD rejects (e.g. malformed wildcards). |
-| `Folder unchanged upstream but ControlD mismatch` | A previous import silently failed or the group was modified externally. The script force-syncs to heal the state. |
+| `Folder unchanged upstream but ControlD mismatch` | Expected when folders share rules: ControlD dedupes across folders at import, which can drain a folder (e.g. a subset list). The forced re-import repopulates it by design. Also fires if a previous import silently failed or the group was modified externally. |
+| Duplicate folders after upgrading from v2.1.x or older | Older versions named groups after the JSON-internal name; v2.2.0+ uses your config key. Groups created under the old names are never touched again, so delete them once manually in the ControlD dashboard. |
 | `Argument list too long` | Fixed in v2.1.2+. Uses file-based uploads for large payloads. Upgrade if on an older version. |
 | `Timeout during import` | v2.2.0+: curl and job timeouts prevent indefinite hangs. Poll window scales with list size. |
 | `Duplicate groups created` | Fixed in v2.2.0: breaks the profile loop when group refresh fails; CI concurrency groups prevent interleaved runs. |
@@ -288,15 +289,15 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 6. **Atomic server-side swaps** — renames existing group to `{name}_OLD`, imports new definition in one shot, then deletes the old. If import fails, rolls back by restoring `{name}_OLD`. Zero downtime, zero rule loss
 7. **Stale group cleanup** — before renaming, checks for leftover `{name}_OLD` from interrupted runs and deletes it to prevent name-collision deadlock.
 8. **Post-import validation** — polls ControlD until rule count matches the source. If mismatch persists after scaled timeout, invalidates cache, re-downloads, and retries once. If retry fails, rolls back cleanly.
-9. **Self-healing validation** — even "unchanged" folders are validated on every sync run. If ControlD reports 0 rules, the folder is force-synced regardless of cache state.
+9. **Self-healing validation** — even "unchanged" folders are validated on every sync run. If the rule count doesn't exactly match the source, the folder is force-synced. This is intentional: ControlD dedupes rules shared across folders at import time, which can drain or empty a folder (e.g. a subset list vs a combined one), and the re-import pulls its rules back. A leftover `_OLD` group (interrupted swap) also forces a sync.
 10. **Large list support** — import payloads are written to a temp file and passed to curl as `@file.json`, bypassing `ARG_MAX`.
 11. **State consistency** — after every `sync_folder` call, the profile's group state is refreshed to prevent cascade desync.
 12. **Name canonicalization** — the config key (friendly name) is used as the canonical ControlD group name, ensuring skip logic, validation lookups, and `_OLD` cleanup all reference the same name.
-13. **Cache commit timing** — persistent cache is only written after a folder syncs successfully across all mapped profiles. If any import fails, the cache is invalidated so the next run re-detects the change.
+13. **Cache commit timing** — the persistent cache (the change-detection baseline) advances only during real sync runs, never during `--check-updates`. If any import fails, the folder's cache entry is invalidated at the end of the run so the next check re-detects the change.
 14. **Schema validation** — every downloaded JSON is checked for expected schema (`group.group` string + `rules` array). Invalid payloads fail early.
 15. **Stable-count validation** — for large lists or server-side deduplication, the script accepts a stable rule count (unchanged across multiple polls) even if it doesn't exactly match the source. This prevents infinite delete/import loops.
 16. **Concurrency protection** — CI uses a `concurrency` group to prevent interleaved runs from deleting each other's `_OLD` backup groups.
-17. **ControlD drift detection (v2.2.4)** — `--check-updates` now queries live ControlD state to verify group existence. Missing groups are flagged as drift. Rule-count mismatch is intentionally **not** checked here because ControlD deduplicates across folders, causing expected count drops that must not trigger re-sync loops.
+17. **ControlD drift detection (v2.2.4)** — `--check-updates` now queries live ControlD state to verify group existence. Missing groups and leftover `_OLD` groups (interrupted swaps, v2.2.5+) are flagged as drift. Rule-count mismatch is intentionally **not** checked here because ControlD deduplicates across folders, causing expected count drops that must not trigger re-sync loops.
 18. Freshness timestamps are parsed with **pure jq** (`fromdateiso8601`) — identical behavior on Linux, macOS, and Termux without platform-specific `date` binaries.
 19. **I/O-friendly API calls** — reusable temp files in the retry loop eliminate `mktemp` churn on SD cards and slow storage.
 20. In GitHub Actions, generates a **markdown summary** on the workflow run page with sync results and upstream freshness.
@@ -310,6 +311,7 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 
 | Version | Highlights |
 |---|---|
+| **v2.2.5** | `--check-updates` no longer advances the change-detection baseline (same-count upstream updates were skipped by the sync job); interrupted swaps detected via leftover `_OLD` groups in both skip-validation and drift detection; signal traps exit cleanly |
 | **v2.2.4** | ControlD drift detection in `--check-updates`; `--no-cache` forces sync in check mode; `CONTROLD_API_TOKEN` required in check job |
 | **v2.2.0** | Name canonicalization; cache commit timing; schema validation; stable-count polling; concurrency protection; auth header file (token no longer in cmdline); I/O-friendly temp files |
 | **v2.1.2** | Large list support (file-based upload bypasses ARG_MAX); state consistency refresh after every sync_folder |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.2.4
+# Version: 2.2.5
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq, cmp
 # =============================================================================
@@ -9,11 +9,11 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.2.4"
+VERSION="2.2.5"
 
 # Bash version check
 if (( BASH_VERSINFO[0] < 4 )); then
-    printf "[ERROR] bash 4.0+ required (found %d.%d)\n" "$BASH_VERSINFO[0]" "$BASH_VERSINFO[1]" >&2
+    printf "[ERROR] bash 4.0+ required (found %d.%d)\n" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" >&2
     exit 1
 fi
 
@@ -398,7 +398,7 @@ hagezi_folder_epoch() {
     if [[ -z "$epoch" || "$epoch" == "null" ]]; then
         local date_clean="${date_str%%.*}"
         date_clean="${date_clean%Z}"
-        epoch=$(date -u -d "${date_clean}UTC" +%s 2>/dev/null || date -j -u -f "%Y-%m-%dT%H:%M:%S" "$date_clean" +%s 2>/dev/null)
+        epoch=$(date -u -d "${date_clean}Z" +%s 2>/dev/null || date -j -u -f "%Y-%m-%dT%H:%M:%S" "$date_clean" +%s 2>/dev/null)
     fi
     [[ -z "$epoch" || "$epoch" == "null" ]] && return 1
 
@@ -449,8 +449,13 @@ download_folder_smart() {
         return 2
     fi
 
-    # Always write persistent cache so --check-updates populates it for the sync job
-    cp "$tmpfile" "$persistent"
+    # The persistent cache is the change-detection baseline, not a download
+    # cache (every run downloads fresh for the cmp). It must only advance
+    # during a real sync run. If --check-updates wrote it, the sync job would
+    # see "unchanged" and skip same-count upstream updates.
+    if [[ "$CHECK_UPDATES" == false ]]; then
+        cp "$tmpfile" "$persistent"
+    fi
     mv "$tmpfile" "$cachefile"
     return 0
 }
@@ -880,7 +885,7 @@ main() {
     fi
 
     if [[ -n "$TARGET_PROFILE" ]]; then
-        if ! profile_exists "$TARGET_PROFILE" ]]; then
+        if ! profile_exists "$TARGET_PROFILE"; then
             log "ERROR: Profile '$TARGET_PROFILE' not found"
             exit 1
         fi
@@ -893,8 +898,11 @@ main() {
         [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
     fi
 
-    # Set trap before mktemp (M10)
-    trap '[[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"' EXIT INT TERM
+    # Cleanup on EXIT only. The signal traps must exit explicitly: a trapped
+    # INT/TERM would otherwise resume the script after WORK_DIR is gone.
+    trap '[[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     WORK_DIR=$(mktemp -d)
     mkdir -p "$WORK_DIR/cache"
 
@@ -969,7 +977,7 @@ main() {
         local drift_cachefile drift_existing_pk
 
         # Need profile list for drift detection (not fetched earlier in --check-updates)
-        ALL_PROFILES=$(get_all_profiles) || exit
+        ALL_PROFILES=$(get_all_profiles) || { log "ERROR: Failed to fetch profiles for drift detection"; exit 2; }
 
         for drift_pname in "${PROFILE_NAMES[@]}"; do
             [[ -n "$TARGET_PROFILE" && "$drift_pname" != "$TARGET_PROFILE" ]] && continue
@@ -997,22 +1005,18 @@ main() {
                     continue
                 fi
 
+                # Case 2: a leftover _OLD group means an interrupted swap and a
+                # possibly half-populated main group
+                local drift_old_pk
+                drift_old_pk=$(find_group_pk_by_name "$drift_groups_json" "${drift_f}_OLD")
+                if [[ -n "$drift_old_pk" && "$drift_old_pk" != "null" ]]; then
+                    log "  DRIFT: '$drift_f' has leftover '_OLD' group in profile '$drift_pname' (interrupted swap)"
+                    drift_found=true
+                    continue
+                fi
+
                 # Group exists and is accounted for — no drift
                 log "  OK: '$drift_f' present in profile '$drift_pname'"
-
-                # Case 2 (DISABLED): Rule count mismatch
-                # ControlD deduplicates across folders — same rule in Folder A
-                # and Folder B will be pruned from A when B is imported. This
-                # creates an expected count drop in A that must not trigger
-                # infinite re-sync loops. Count validation is handled during
-                # the actual import_with_validation() call, not here.
-                #
-                # drift_expected_count=$(jq '.rules | length' "$drift_cachefile")
-                # drift_actual_count=$(jq --arg pk "$drift_existing_pk" '.body.groups[] | select(.PK == ($pk | tonumber)) | .count' <<< "$drift_groups_json")
-                # if [[ -z "$drift_actual_count" || "$drift_actual_count" == "null" || "$drift_actual_count" -eq 0 || "$drift_actual_count" -ne "$drift_expected_count" ]]; then
-                #     log "  DRIFT: '$drift_f' count mismatch in profile '$drift_pname' (${drift_actual_count:-null} vs ${drift_expected_count})"
-                #     drift_found=true
-                # fi
             done
         done
 
@@ -1027,7 +1031,7 @@ main() {
         exit 1
     fi
 
-    ALL_PROFILES=$(get_all_profiles) || exit
+    ALL_PROFILES=$(get_all_profiles) || { log "ERROR: Failed to fetch profiles"; exit 2; }
 
     for pname in "${PROFILE_NAMES[@]}"; do
         [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]] && continue
@@ -1070,11 +1074,24 @@ main() {
             fi
 
             if [[ "${FOLDER_CHANGED[$f]}" == "false" ]]; then
-                # Cache says unchanged — but validate ControlD still has the rules
+                # Cache says unchanged, but validate ControlD still has the rules.
+                # The exact count match is deliberate: ControlD dedupes rules
+                # shared across folders at import time, which can drain or empty
+                # a folder (an IDNs folder whose rules are a subset of combined
+                # TLDs, for example). A mismatch forces a re-import to repopulate
+                # the folder. The hourly drift check skips count comparison for
+                # the same reason: it would re-trigger the pipeline forever.
                 local existing_pk
                 existing_pk=$(find_group_pk_by_name "$current_groups_json" "$f")
 
-                if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
+                # A leftover _OLD group means a previous swap was interrupted
+                # mid-import and the main group may be partially populated
+                local stale_old_pk
+                stale_old_pk=$(find_group_pk_by_name "$current_groups_json" "${f}_OLD")
+                if [[ -n "$stale_old_pk" && "$stale_old_pk" != "null" ]]; then
+                    log "  Folder: $f — leftover '${f}_OLD' found (interrupted swap), forcing sync"
+                    needs_sync=true
+                elif [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
                     local actual_count expected_count
                     expected_count=$(jq '.rules | length' "$cachefile")
                     actual_count=$(jq --arg pk "$existing_pk" '.body.groups[] | select(.PK == ($pk | tonumber)) | .count' <<< "$current_groups_json")
@@ -1084,7 +1101,7 @@ main() {
                         summary_row "$pname" "$f" "⏭️ Unchanged" "-"
                         continue
                     else
-                        log "  Folder: $f — unchanged upstream but ControlD mismatch ($actual_count vs $expected_count), forcing sync"
+                        log "  Folder: $f — unchanged upstream but ControlD mismatch (${actual_count:-null} vs $expected_count), forcing sync"
                         needs_sync=true
                     fi
                 else
