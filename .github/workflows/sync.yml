@@ -49,6 +49,7 @@ jobs:
         id: check
         if: ${{ inputs.skip_check != true }}
         env:
+          CONTROLD_API_TOKEN: ${{ secrets.CONTROLD_API_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
@@ -65,7 +66,7 @@ jobs:
       - name: Set output
         id: set-output
         run: |
-          if [[ "${{ inputs.skip_check }}" == "true" ]]; then
+          if [[ "${{ inputs.skip_check }}" == "true" || "${{ inputs.no_cache }}" == "true" ]]; then
             echo "updates=true" >> "$GITHUB_OUTPUT"
           else
             echo "updates=${{ steps.check.outputs.updates }}" >> "$GITHUB_OUTPUT"

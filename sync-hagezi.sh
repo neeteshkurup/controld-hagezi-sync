@@ -932,6 +932,13 @@ main() {
 
     log "Download complete: $downloaded new, $skipped unchanged, $failed failed"
 
+    # --no-cache means "don't trust cached state" — force a sync regardless
+    if [[ "$CHECK_UPDATES" == true && "$NO_CACHE" == true ]]; then
+        log "MODE: NO-CACHE — forcing sync regardless of upstream state"
+        echo "HAGEZI_UPDATES_AVAILABLE=true"
+        exit 0
+    fi
+
     if [[ "$CHECK_UPDATES" == true ]]; then
         print_freshness_report
 
