@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.2.1
+# Version: 2.2.2
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq, cmp
 # =============================================================================
@@ -9,7 +9,7 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 
 # Bash version check
 if (( BASH_VERSINFO[0] < 4 )); then
@@ -132,6 +132,9 @@ api_call_with_retry() {
             delay=$((delay * 2))
         else
             log "  ERROR: API call failed (HTTP $code) on $method $(redact_url "$url")"
+            local resp_body
+            resp_body=$(cat "$API_BODY_FILE" 2>/dev/null | head -c 500)
+            [[ -n "$resp_body" ]] && log "  RESPONSE: $resp_body"
             return 1
         fi
     done
@@ -456,6 +459,8 @@ download_folder_smart() {
         return 2
     fi
 
+    # Always write persistent cache so --check-updates populates it for the sync job
+    cp "$tmpfile" "$persistent"
     mv "$tmpfile" "$cachefile"
     return 0
 }
@@ -1042,18 +1047,13 @@ main() {
 
     print_freshness_report
 
-    # Commit persistent cache only for successfully synced folders (H2 fix)
+    # Cache is written during download; on failure we invalidate so next run retries
     if [[ "$CHECK_UPDATES" == false ]]; then
         for fname in "${!HAGEZI_FOLDERS[@]}"; do
-            local src="$WORK_DIR/cache/$(safe_name "$fname").json"
             local dst="$SYNC_CACHE/$(safe_name "$fname").json"
             if [[ "${FOLDER_FAILED[$fname]}" == "1" ]]; then
                 rm -f "$dst"
                 log "  $fname: sync failed, cache invalidated"
-            else
-                if [[ -f "$src" ]]; then
-                    cp "$src" "$dst"
-                fi
             fi
         done
     fi
