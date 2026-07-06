@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.2.5
+# Version: 2.2.6
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq, cmp
 # =============================================================================
@@ -9,7 +9,7 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.2.5"
+VERSION="2.2.6"
 
 # Bash version check
 if (( BASH_VERSINFO[0] < 4 )); then
@@ -415,7 +415,11 @@ download_folder_smart() {
     local tmpfile="$WORK_DIR/$(safe_name "$fname")_dl.json"
     local code
 
-    code=$(curl -sL --connect-timeout 10 --max-time 60 -o "$tmpfile" -w "%{http_code}" "$url")
+    local gh_headers=()
+    if [[ "$url" == *"raw.githubusercontent.com"* && -n "${GITHUB_TOKEN:-}" ]]; then
+        gh_headers=(-H "Authorization: token ${GITHUB_TOKEN}")
+    fi
+    code=$(curl -sL --connect-timeout 10 --max-time 60 "${gh_headers[@]}" -o "$tmpfile" -w "%{http_code}" "$url")
 
     if [[ "$code" != "200" ]]; then
         log "  ERROR: $fname: HTTP $code"
