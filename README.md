@@ -44,6 +44,7 @@ Automatically sync HaGeZi DNS blocklists to your ControlD profiles via the Contr
 - **Self-healing on every run** — even "unchanged" folders are validated against ControlD. If a previous import silently failed or a group was manually deleted, it is force-synced automatically
 - **Stale group cleanup** — detects and removes leftover `_OLD` groups from interrupted runs before attempting renames
 - **Large list support** — file-based upload bypasses `ARG_MAX` for blocklists with hundreds of thousands of rules
+- **Automated cleanup** — scheduled workflow-run cleanup keeps your Actions history tidy (retains the latest run, deletes old logs/runs after 30 days or 100 runs)
 
 ---
 
@@ -232,6 +233,16 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 
 > **Note:** The `check` job requires `CONTROLD_API_TOKEN` for drift detection. It is masked automatically in GitHub Actions logs.
 
+### Automated cleanup
+
+A separate **`Cleanup workflow runs`** workflow runs on a monthly schedule and after every successful scheduled sync. It:
+
+- Deletes logs from the completed sync run
+- Removes old workflow runs older than **30 days**
+- Enforces a maximum of **100 retained runs** per workflow
+- Always preserves the **latest run** as a sentinel
+- Supports a manual `force_delete_all` option via `workflow_dispatch`
+
 ---
 
 ## Security Notes
@@ -273,6 +284,7 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 | `Duplicate groups created` | Fixed in v2.2.0: breaks the profile loop when group refresh fails; CI concurrency groups prevent interleaved runs. |
 | `--check-updates returns true but nothing changed upstream` | A group was manually deleted or a previous import failed silently. Drift detection (v2.2.4+) triggers sync to recreate the missing group. Check logs for `DRIFT:` messages. |
 | `--no-cache still runs the check job` | v2.2.4+: `--no-cache` forces `HAGEZI_UPDATES_AVAILABLE=true` in `--check-updates` mode, and the CI workflow bypasses the check when `no_cache` is set. |
+| `Most Abused TLDs: HTTP 429` | v2.2.6+: raw GitHub downloads now use `GITHUB_TOKEN` authentication (5000 req/hr instead of 60). Ensure `GITHUB_TOKEN` is available in your Actions environment. |
 
 ---
 
@@ -303,6 +315,7 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 20. In GitHub Actions, generates a **markdown summary** on the workflow run page with sync results and upstream freshness.
 
 > **Note on caching:** GitHub raw URLs do not support HTTP conditional requests (If-Modified-Since / ETag). The full payload is always downloaded. The cache saves ControlD API work, not bandwidth. For GitHub Actions, `actions/cache` persists the cache directory between runs.
+> **Note on rate limits:** As of v2.2.6, raw GitHub downloads use `Authorization: token $GITHUB_TOKEN` when available, raising the limit from 60 req/hr (unauthenticated) to 5000 req/hr. This prevents HTTP 429 failures on busy runners.
 
 </details>
 
@@ -311,6 +324,7 @@ Cache is passed between jobs using distinct keys (`hagezi-content-check-*` → `
 
 | Version | Highlights |
 |---|---|
+| **v2.2.6** | Authenticated raw GitHub downloads using `GITHUB_TOKEN` to avoid rate limits (HTTP 429); automated workflow-run cleanup |
 | **v2.2.5** | `--check-updates` no longer advances the change-detection baseline (same-count upstream updates were skipped by the sync job); interrupted swaps detected via leftover `_OLD` groups in both skip-validation and drift detection; signal traps exit cleanly |
 | **v2.2.4** | ControlD drift detection in `--check-updates`; `--no-cache` forces sync in check mode; `CONTROLD_API_TOKEN` required in check job |
 | **v2.2.0** | Name canonicalization; cache commit timing; schema validation; stable-count polling; concurrency protection; auth header file (token no longer in cmdline); I/O-friendly temp files |
