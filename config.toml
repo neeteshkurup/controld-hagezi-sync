@@ -63,5 +63,5 @@ names = ["Family"]
 # =============================================================================
 
 [profile_folders]
-Family = ["Badware Hoster", "Nosafesearch"]
+Family = ["Referral Allow"]
 #Family = ["Badware Hoster", "NoSafeSearch", "Referral Allow", "Apple Private Relay Allow", "Meta Tracker Allow", "Microsoft Allow", "Ultimate Known Issues Allow", "Native Tracker Amazon", "Native Tracker Apple", "Native Tracker Huawei", "Native Tracker LGWebOS", "Native Tracker Microsoft", "Native Tracker Oppo", "Native Tracker Roku", "Native Tracker Samsung", "Native Tracker Tiktok", "Native Tracker Vivo", "Native Tracker Xiaomi"]
