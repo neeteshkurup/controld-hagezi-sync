@@ -20,7 +20,7 @@ dry_run = false
 
 [profiles]
 # Exact names of your ControlD profiles (case-sensitive).
-names = ["Family"]
+names = ["Family", "MyDevices"]
 
 # =============================================================================
 # FOLDER DEFINITIONS
@@ -64,4 +64,5 @@ names = ["Family"]
 
 [profile_folders]
 Family = ["Referral Allow"]
+MyDevices = ["Referral Allow", "Apple Private Relay Allow", "Meta Tracker Allow", "Microsoft Allow", "Ultimate Known Issues Allow"]
 #Family = ["Badware Hoster", "NoSafeSearch", "Referral Allow", "Apple Private Relay Allow", "Meta Tracker Allow", "Microsoft Allow", "Ultimate Known Issues Allow", "Native Tracker Amazon", "Native Tracker Apple", "Native Tracker Huawei", "Native Tracker LGWebOS", "Native Tracker Microsoft", "Native Tracker Oppo", "Native Tracker Roku", "Native Tracker Samsung", "Native Tracker Tiktok", "Native Tracker Vivo", "Native Tracker Xiaomi"]
